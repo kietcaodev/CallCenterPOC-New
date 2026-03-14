@@ -85,7 +85,14 @@ else if (!string.IsNullOrEmpty(blobAccountUri))
 }
 else
 {
-    // No blob storage configured — use a null-safe fallback that fails instantly (no retries)
+    // No blob storage configured — use local file storage
+    builder.Configuration["Storage:UseLocalFiles"] = "true";
+    var dataDir = OperatingSystem.IsLinux()
+        ? "/opt/CallCenterPOC-New/data"
+        : Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "data");
+    builder.Configuration["Storage:DataDir"] = dataDir;
+
+    // Register a dummy BlobServiceClient (required by service constructors, but won't be used)
     var noRetryOptions = new Azure.Storage.Blobs.BlobClientOptions();
     noRetryOptions.Retry.MaxRetries = 0;
     builder.Services.AddSingleton(new BlobServiceClient("DefaultEndpointsProtocol=https;AccountName=none;AccountKey=bm9uZQ==;BlobEndpoint=https://localhost:0", noRetryOptions));

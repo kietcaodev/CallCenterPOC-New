@@ -9,6 +9,8 @@ namespace ContactCenterPOC.Services
         private readonly BlobServiceClient _blobServiceClient;
         private readonly string _containerName;
         private readonly ILogger<SettingsService> _logger;
+        private readonly bool _useLocalFiles;
+        private readonly string _localFilePath;
         private const string SettingsBlobName = "settings.json";
 
         private OperatorSettings? _cached;
@@ -32,6 +34,9 @@ namespace ContactCenterPOC.Services
             _blobServiceClient = blobServiceClient;
             _containerName = configuration["BlobStorage:ContainerName"] ?? "callcenter-data";
             _logger = logger;
+            _useLocalFiles = string.Equals(configuration["Storage:UseLocalFiles"], "true", StringComparison.OrdinalIgnoreCase);
+            var dataDir = configuration["Storage:DataDir"] ?? "data";
+            _localFilePath = Path.Combine(dataDir, "settings.json");
         }
 
         public async Task<OperatorSettings> GetSettingsAsync()
@@ -100,19 +105,33 @@ namespace ContactCenterPOC.Services
 
                 try
                 {
-                    var containerClient = _blobServiceClient.GetBlobContainerClient(_containerName);
-                    var exists = await containerClient.ExistsAsync();
-                    if (exists.Value)
+                    var json = JsonSerializer.Serialize(settings, _writeOptions);
+
+                    if (_useLocalFiles)
                     {
-                        var blobClient = containerClient.GetBlobClient(SettingsBlobName);
-                        var json = JsonSerializer.Serialize(settings, _writeOptions);
-                        using var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(json));
-                        await blobClient.UploadAsync(stream, overwrite: true);
-                        _logger.LogInformation("Settings saved (MaxCallTime={MaxCallTime}min, VoiceApi={VoiceApi}, Voice={Voice})", settings.MaxCallTimeMinutes, settings.VoiceApiMode, settings.SelectedVoice);
+                        var dir = Path.GetDirectoryName(_localFilePath);
+                        if (!string.IsNullOrEmpty(dir))
+                            Directory.CreateDirectory(dir);
+                        await File.WriteAllTextAsync(_localFilePath, json);
+                        _logger.LogInformation("Settings saved to local file (MaxCallTime={MaxCallTime}min, VoiceApi={VoiceApi}, Voice={Voice})",
+                            settings.MaxCallTimeMinutes, settings.VoiceApiMode, settings.SelectedVoice);
                     }
                     else
                     {
-                        _logger.LogWarning("Blob container '{ContainerName}' does not exist; settings saved in-memory only", _containerName);
+                        var containerClient = _blobServiceClient.GetBlobContainerClient(_containerName);
+                        var exists = await containerClient.ExistsAsync();
+                        if (exists.Value)
+                        {
+                            var blobClient = containerClient.GetBlobClient(SettingsBlobName);
+                            using var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(json));
+                            await blobClient.UploadAsync(stream, overwrite: true);
+                            _logger.LogInformation("Settings saved (MaxCallTime={MaxCallTime}min, VoiceApi={VoiceApi}, Voice={Voice})",
+                                settings.MaxCallTimeMinutes, settings.VoiceApiMode, settings.SelectedVoice);
+                        }
+                        else
+                        {
+                            _logger.LogWarning("Blob container '{ContainerName}' does not exist; settings saved in-memory only", _containerName);
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -134,6 +153,14 @@ namespace ContactCenterPOC.Services
         {
             try
             {
+                if (_useLocalFiles)
+                {
+                    if (!File.Exists(_localFilePath))
+                        return null;
+                    var json = await File.ReadAllTextAsync(_localFilePath);
+                    return JsonSerializer.Deserialize<OperatorSettings>(json, _readOptions);
+                }
+
                 var containerClient = _blobServiceClient.GetBlobContainerClient(_containerName);
                 var exists = await containerClient.ExistsAsync();
                 if (!exists.Value) return null;
@@ -142,8 +169,8 @@ namespace ContactCenterPOC.Services
                 if (!await blobClient.ExistsAsync()) return null;
 
                 var response = await blobClient.DownloadContentAsync();
-                var json = response.Value.Content.ToString();
-                return JsonSerializer.Deserialize<OperatorSettings>(json, _readOptions);
+                var blobJson = response.Value.Content.ToString();
+                return JsonSerializer.Deserialize<OperatorSettings>(blobJson, _readOptions);
             }
             catch (Exception ex)
             {

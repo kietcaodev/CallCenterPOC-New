@@ -13,6 +13,8 @@ namespace ContactCenterPOC.Services
         private readonly string _containerName;
         private readonly string _historyPrefix = "call-history/";
         private const string AcsMetadataFileName = "0-acsmetadata.json";
+        private readonly bool _useLocalFiles;
+        private readonly string _localHistoryDir;
         private readonly List<CallHistorySummary> _summaryCache = new();
         private bool _cacheLoaded = false;
         private DateTimeOffset _cacheLoadedAtUtc = DateTimeOffset.MinValue;
@@ -36,6 +38,9 @@ namespace ContactCenterPOC.Services
             _configuration = configuration;
             _logger = logger;
             _containerName = configuration["BlobStorage:ContainerName"] ?? "callcenter-data";
+            _useLocalFiles = string.Equals(configuration["Storage:UseLocalFiles"], "true", StringComparison.OrdinalIgnoreCase);
+            var dataDir = configuration["Storage:DataDir"] ?? "data";
+            _localHistoryDir = Path.Combine(dataDir, "call-history");
 
             _cacheTtl = TimeSpan.FromSeconds(5);
             if (int.TryParse(configuration["CallHistory:CacheTtlSeconds"], out var cacheTtlSeconds) && cacheTtlSeconds > 0)
@@ -43,38 +48,36 @@ namespace ContactCenterPOC.Services
                 _cacheTtl = TimeSpan.FromSeconds(cacheTtlSeconds);
             }
 
-            var blobContainerUrl = configuration["BlobContainer"];
-            if (!string.IsNullOrWhiteSpace(blobContainerUrl))
-            {
-                _logger.LogInformation("CallHistoryService using container '{ContainerName}' (BlobContainer configured)", _containerName);
-            }
-            else
-            {
-                _logger.LogInformation("CallHistoryService using container '{ContainerName}'", _containerName);
-            }
+            _logger.LogInformation("CallHistoryService using {Mode} storage", _useLocalFiles ? "local file" : "blob");
         }
 
         public async Task SaveCallRecordAsync(CallRecord record)
         {
             try
             {
-                var containerClient = _blobServiceClient.GetBlobContainerClient(_containerName);
-
-                // Saving a record should not attempt to create the container.
-                // Container creation can fail under constrained permissions/network rules.
-                var exists = await containerClient.ExistsAsync();
-                if (!exists.Value)
-                {
-                    _logger.LogWarning("Blob container '{ContainerName}' does not exist; cannot save call record {CallConnectionId}", _containerName, record.CallConnectionId);
-                    return;
-                }
-
-                var blobName = $"{_historyPrefix}{record.CallConnectionId}.json";
-                var blobClient = containerClient.GetBlobClient(blobName);
-
                 var json = JsonSerializer.Serialize(record, _writeOptions);
-                using var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(json));
-                await blobClient.UploadAsync(stream, overwrite: true);
+
+                if (_useLocalFiles)
+                {
+                    Directory.CreateDirectory(_localHistoryDir);
+                    var filePath = Path.Combine(_localHistoryDir, $"{record.CallConnectionId}.json");
+                    await File.WriteAllTextAsync(filePath, json);
+                }
+                else
+                {
+                    var containerClient = _blobServiceClient.GetBlobContainerClient(_containerName);
+                    var exists = await containerClient.ExistsAsync();
+                    if (!exists.Value)
+                    {
+                        _logger.LogWarning("Blob container '{ContainerName}' does not exist; cannot save call record {CallConnectionId}", _containerName, record.CallConnectionId);
+                        return;
+                    }
+
+                    var blobName = $"{_historyPrefix}{record.CallConnectionId}.json";
+                    var blobClient = containerClient.GetBlobClient(blobName);
+                    using var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(json));
+                    await blobClient.UploadAsync(stream, overwrite: true);
+                }
 
                 // Update summary cache
                 await _cacheLock.WaitAsync();
@@ -157,6 +160,15 @@ namespace ContactCenterPOC.Services
         {
             try
             {
+                if (_useLocalFiles)
+                {
+                    var filePath = Path.Combine(_localHistoryDir, $"{callConnectionId}.json");
+                    if (!File.Exists(filePath))
+                        return null;
+                    var json = await File.ReadAllTextAsync(filePath);
+                    return JsonSerializer.Deserialize<CallRecord>(json, _readOptions);
+                }
+
                 var containerClient = _blobServiceClient.GetBlobContainerClient(_containerName);
                 var blobName = $"{_historyPrefix}{callConnectionId}.json";
                 var blobClient = containerClient.GetBlobClient(blobName);
@@ -165,8 +177,8 @@ namespace ContactCenterPOC.Services
                     return null;
 
                 var response = await blobClient.DownloadContentAsync();
-                var json = response.Value.Content.ToString();
-                return JsonSerializer.Deserialize<CallRecord>(json, _readOptions);
+                var blobJson = response.Value.Content.ToString();
+                return JsonSerializer.Deserialize<CallRecord>(blobJson, _readOptions);
             }
             catch (Exception ex)
             {
@@ -200,45 +212,62 @@ namespace ContactCenterPOC.Services
         {
             try
             {
-                var containerClient = _blobServiceClient.GetBlobContainerClient(_containerName);
-
-                // Loading history should be a read-only operation. Avoid creating the container here,
-                // since container creation can fail under constrained permissions/network rules.
-                var exists = await containerClient.ExistsAsync();
-                if (!exists.Value)
-                {
-                    _summaryCache.Clear();
-                    _logger.LogInformation("Blob container '{ContainerName}' does not exist; call history is empty", _containerName);
-                    return true;
-                }
-
                 var records = new List<CallRecord>();
 
-                await LoadCallHistoryRecordsAsync(containerClient, records);
-
-                // If there are no saved call records, attempt to reconstruct history from ACS recording metadata.
-                // This helps populate history for calls made before proper call-history persistence was available.
-                if (records.Count == 0)
+                if (_useLocalFiles)
                 {
-                    var rebuilt = await TryRebuildFromAcsRecordingMetadataAsync(containerClient);
-                    if (rebuilt.Count > 0)
+                    if (Directory.Exists(_localHistoryDir))
                     {
-                        records.AddRange(rebuilt);
+                        foreach (var file in Directory.GetFiles(_localHistoryDir, "*.json"))
+                        {
+                            try
+                            {
+                                var json = await File.ReadAllTextAsync(file);
+                                var record = JsonSerializer.Deserialize<CallRecord>(json, _readOptions);
+                                if (record != null)
+                                    records.Add(record);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogWarning(ex, "Failed to load call record from {File}", file);
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    var containerClient = _blobServiceClient.GetBlobContainerClient(_containerName);
+                    var exists = await containerClient.ExistsAsync();
+                    if (!exists.Value)
+                    {
+                        _summaryCache.Clear();
+                        _logger.LogInformation("Blob container '{ContainerName}' does not exist; call history is empty", _containerName);
+                        return true;
+                    }
+
+                    await LoadCallHistoryRecordsAsync(containerClient, records);
+
+                    if (records.Count == 0)
+                    {
+                        var rebuilt = await TryRebuildFromAcsRecordingMetadataAsync(containerClient);
+                        if (rebuilt.Count > 0)
+                        {
+                            records.AddRange(rebuilt);
+                        }
                     }
                 }
 
-                // Sort by most recent first
                 _summaryCache.Clear();
                 _summaryCache.AddRange(
                     records.OrderByDescending(r => r.StartedAt)
                            .Select(ToSummary));
 
-                _logger.LogInformation("Loaded {Count} call history records from Blob Storage", _summaryCache.Count);
+                _logger.LogInformation("Loaded {Count} call history records", _summaryCache.Count);
                 return true;
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Failed to load call history from Blob Storage");
+                _logger.LogWarning(ex, "Failed to load call history");
                 return false;
             }
         }

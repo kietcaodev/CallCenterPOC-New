@@ -129,8 +129,17 @@ namespace ContactCenterPOC.Controllers
                 callConnectionId = c.CallConnectionId,
                 targetPhoneNumber = c.TargetPhoneNumber,
                 campaignTitle = c.CampaignTitle,
+                contactName = c.ContactName,
                 status = c.Status.ToString(),
-                startedAt = c.StartedAt
+                startedAt = c.StartedAt,
+                transcriptEntries = c.TranscriptEntries.Select(t => new
+                {
+                    speaker = t.Speaker,
+                    text = t.Text,
+                    timestamp = t.Timestamp,
+                    sentiment = t.Sentiment,
+                    emotion = t.Emotion
+                })
             }).ToList();
 
             return Ok(new

@@ -72,7 +72,10 @@ namespace ContactCenterPOC.Services
                 await _hubContext.Clients.All.SendAsync("CallStatusChanged", new
                 {
                     callConnectionId = uuid,
-                    status = "Connected"
+                    status = "Connected",
+                    phoneNumber = activeCall.TargetPhoneNumber,
+                    contactName = activeCall.ContactName,
+                    campaignTitle = activeCall.CampaignTitle
                 });
 
                 _logger.LogInformation("FreeSWITCH call answered and audio fork started: {UUID}", uuid);
@@ -320,7 +323,10 @@ namespace ContactCenterPOC.Services
             await _hubContext.Clients.All.SendAsync("CallStatusChanged", new
             {
                 callConnectionId = callConnectionId,
-                status = "Connected"
+                status = "Connected",
+                phoneNumber = activeCall.TargetPhoneNumber,
+                contactName = activeCall.ContactName,
+                campaignTitle = activeCall.CampaignTitle
             });
 
             var handler = new FreeSwitchMediaHandler(

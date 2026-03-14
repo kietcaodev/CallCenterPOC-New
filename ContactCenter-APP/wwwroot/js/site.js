@@ -401,6 +401,7 @@
                     connection.invoke("JoinCall", id);
                 }
             });
+            fetchActiveCalls();
         });
 
         connection.onclose(function () {
@@ -412,6 +413,50 @@
         }).catch(function (err) {
             console.error("SignalR connection error:", err);
         });
+    }
+
+    // ─── Fetch Active Calls (inbound detection) ─────────────
+    function fetchActiveCalls() {
+        fetch(apiBaseUrl() + "/api/Call/active")
+            .then(function (resp) { return resp.json(); })
+            .then(function (data) {
+                if (data.calls && data.calls.length > 0) {
+                    data.calls.forEach(function (c) {
+                        if (calls[c.callConnectionId]) return;
+                        registerCall(c.callConnectionId, c.targetPhoneNumber || "Inbound", c.campaignTitle || "");
+                        // Set elapsed time from startedAt
+                        if (c.startedAt) {
+                            var elapsed = Math.floor((Date.now() - new Date(c.startedAt).getTime()) / 1000);
+                            if (elapsed > 0) calls[c.callConnectionId].timerSeconds = elapsed;
+                        }
+                        handleCallStatus(c.callConnectionId, c.status, {
+                            callConnectionId: c.callConnectionId,
+                            phoneNumber: c.targetPhoneNumber,
+                            campaignTitle: c.campaignTitle,
+                            contactName: c.contactName
+                        });
+                        // Replay transcript entries that were missed
+                        if (c.transcriptEntries) {
+                            c.transcriptEntries.forEach(function (entry) {
+                                handleTranscriptUpdate({
+                                    callConnectionId: c.callConnectionId,
+                                    speaker: entry.speaker,
+                                    text: entry.text,
+                                    timestamp: entry.timestamp,
+                                    sentiment: entry.sentiment,
+                                    emotion: entry.emotion
+                                });
+                            });
+                        }
+                        if (connection && connection.state === signalR.HubConnectionState.Connected) {
+                            connection.invoke("JoinCall", c.callConnectionId);
+                        }
+                    });
+                }
+            })
+            .catch(function (err) {
+                console.warn("Failed to fetch active calls:", err);
+            });
     }
 
     // ─── Call Registration & Tabs ────────────────────────────
@@ -1852,6 +1897,11 @@
 
         // Render KPIs from session
         renderKPIs();
+
+        // Auto-start SignalR for inbound call detection
+        ensureSignalR().then(function () {
+            fetchActiveCalls();
+        });
 
         // Load settings into overlay
         loadSettings();

@@ -11,9 +11,22 @@ namespace ContactCenterPOC.Services
         private readonly ILogger<CampaignService> _logger;
         private readonly string _containerName;
         private readonly string _blobName = "campaigns.json";
+        private readonly bool _useLocalFiles;
+        private readonly string _localFilePath;
         private List<Campaign> _campaigns = new();
         private bool _initialized = false;
         private readonly SemaphoreSlim _initLock = new(1, 1);
+
+        private static readonly JsonSerializerOptions _writeOptions = new()
+        {
+            WriteIndented = true,
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+        };
+
+        private static readonly JsonSerializerOptions _readOptions = new()
+        {
+            PropertyNameCaseInsensitive = true
+        };
 
         public CampaignService(BlobServiceClient blobServiceClient, IConfiguration configuration, ILogger<CampaignService> logger)
         {
@@ -21,6 +34,9 @@ namespace ContactCenterPOC.Services
             _configuration = configuration;
             _logger = logger;
             _containerName = configuration["BlobStorage:ContainerName"] ?? "callcenter-data";
+            _useLocalFiles = string.Equals(configuration["Storage:UseLocalFiles"], "true", StringComparison.OrdinalIgnoreCase);
+            var dataDir = configuration["Storage:DataDir"] ?? "data";
+            _localFilePath = Path.Combine(dataDir, "campaigns.json");
         }
 
         private async Task EnsureInitializedAsync()
@@ -45,6 +61,23 @@ namespace ContactCenterPOC.Services
         {
             try
             {
+                if (_useLocalFiles)
+                {
+                    if (File.Exists(_localFilePath))
+                    {
+                        var json = await File.ReadAllTextAsync(_localFilePath);
+                        _campaigns = JsonSerializer.Deserialize<List<Campaign>>(json, _readOptions) ?? new List<Campaign>();
+                        _logger.LogInformation("Loaded {Count} campaigns from local file", _campaigns.Count);
+                    }
+                    else
+                    {
+                        _logger.LogInformation("No local campaigns file found, loading defaults");
+                        _campaigns = GetDefaultCampaigns();
+                        await SaveCampaignsAsync();
+                    }
+                    return;
+                }
+
                 var containerClient = _blobServiceClient.GetBlobContainerClient(_containerName);
                 await containerClient.CreateIfNotExistsAsync();
                 var blobClient = containerClient.GetBlobClient(_blobName);
@@ -77,15 +110,21 @@ namespace ContactCenterPOC.Services
         {
             try
             {
+                var json = JsonSerializer.Serialize(_campaigns, _writeOptions);
+
+                if (_useLocalFiles)
+                {
+                    var dir = Path.GetDirectoryName(_localFilePath);
+                    if (!string.IsNullOrEmpty(dir))
+                        Directory.CreateDirectory(dir);
+                    await File.WriteAllTextAsync(_localFilePath, json);
+                    _logger.LogInformation("Saved {Count} campaigns to local file", _campaigns.Count);
+                    return;
+                }
+
                 var containerClient = _blobServiceClient.GetBlobContainerClient(_containerName);
                 await containerClient.CreateIfNotExistsAsync();
                 var blobClient = containerClient.GetBlobClient(_blobName);
-
-                var json = JsonSerializer.Serialize(_campaigns, new JsonSerializerOptions
-                {
-                    WriteIndented = true,
-                    PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-                });
 
                 using var stream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(json));
                 await blobClient.UploadAsync(stream, overwrite: true);
@@ -93,7 +132,7 @@ namespace ContactCenterPOC.Services
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to save campaigns to Blob Storage");
+                _logger.LogError(ex, "Failed to save campaigns");
             }
         }
 
