@@ -195,7 +195,7 @@ namespace ContactCenterPOC.Models
 
         public async Task CloseWebSocketAsync(WebSocketReceiveResult result)
         {
-            await m_webSocket.CloseAsync(result.CloseStatus.Value, result.CloseStatusDescription, CancellationToken.None);
+            await m_webSocket.CloseAsync(result.CloseStatus ?? WebSocketCloseStatus.NormalClosure, result.CloseStatusDescription, CancellationToken.None);
         }
 
         public async Task CloseNormalWebSocketAsync()

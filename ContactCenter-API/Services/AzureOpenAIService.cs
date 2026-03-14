@@ -53,7 +53,7 @@ namespace ContactCenterPOC.Services
             try
             {
                 _logger.LogInformation("[AI-{CallId}] Creating AI session (no prompt)...", callConnectionId);
-                m_aiSession = CreateAISessionAsync(configuration, null).GetAwaiter().GetResult();
+                m_aiSession = CreateAISessionAsync(configuration, null!).GetAwaiter().GetResult();
                 _sessionReady = true;
                 _logger.LogInformation("[AI-{CallId}] AI session created successfully", callConnectionId);
             }
@@ -92,7 +92,7 @@ namespace ContactCenterPOC.Services
             try
             {
                 _logger.LogInformation("[AI-{CallId}] Creating AI session with prompt ({PromptLen} chars)...", callConnectionId, prompt?.Length ?? 0);
-                m_aiSession = CreateAISessionAsync(configuration, prompt).GetAwaiter().GetResult();
+                m_aiSession = CreateAISessionAsync(configuration, prompt!).GetAwaiter().GetResult();
                 _sessionReady = true;
                 _logger.LogInformation("[AI-{CallId}] AI session created successfully", callConnectionId);
             }
@@ -113,7 +113,7 @@ namespace ContactCenterPOC.Services
             var openAiModelName = configuration["AzureOpenAI:DeploymentName"];
             ArgumentNullException.ThrowIfNullOrEmpty(openAiModelName);
 
-            string systemPrompt = prompt;
+            string? systemPrompt = prompt;
             if (systemPrompt == null)
             {
                 systemPrompt = configuration["AzureOpenAI:SystemPrompt"];

@@ -4,18 +4,18 @@ namespace ContactCenterPOC.Models
 {
     public class CallbackEvent
     {
-        public string CallConnectionId { get; set; }
-        public string EventType { get; set; }
+        public string CallConnectionId { get; set; } = string.Empty;
+        public string EventType { get; set; } = string.Empty;
         public DateTimeOffset Timestamp { get; set; }
-        public CallbackEventData Data { get; set; }
+        public CallbackEventData Data { get; set; } = new();
     }
 
     public class CallbackEventData
     {
-        public string CallState { get; set; }
-        public string OperationContext { get; set; }
-        public string ResultCode { get; set; }
-        public string ResultSubcode { get; set; }
+        public string CallState { get; set; } = string.Empty;
+        public string OperationContext { get; set; } = string.Empty;
+        public string ResultCode { get; set; } = string.Empty;
+        public string ResultSubcode { get; set; } = string.Empty;
     }
 
     public class CallRequest

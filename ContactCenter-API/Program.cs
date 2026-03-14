@@ -85,9 +85,10 @@ else if (!string.IsNullOrEmpty(blobAccountUri))
 }
 else
 {
-    // No blob storage configured — use a null-safe fallback
-    // CallHistoryService.SaveCallRecordAsync will catch and log errors gracefully
-    builder.Services.AddSingleton(new BlobServiceClient("DefaultEndpointsProtocol=https;AccountName=none;AccountKey=bm9uZQ==;BlobEndpoint=https://localhost:0"));
+    // No blob storage configured — use a null-safe fallback that fails instantly (no retries)
+    var noRetryOptions = new Azure.Storage.Blobs.BlobClientOptions();
+    noRetryOptions.Retry.MaxRetries = 0;
+    builder.Services.AddSingleton(new BlobServiceClient("DefaultEndpointsProtocol=https;AccountName=none;AccountKey=bm9uZQ==;BlobEndpoint=https://localhost:0", noRetryOptions));
     builder.Logging.AddFilter("Azure.Core", LogLevel.Error);
 }
 
