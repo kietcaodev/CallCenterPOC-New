@@ -252,21 +252,34 @@
     };
 
     // ─── Phone Validation ────────────────────────────────────
+    // Accept E.164 (+84xxx) or local Vietnamese (0xxx, 8-11 digits)
     var e164Regex = /^\+[1-9]\d{1,14}$/;
+    var localRegex = /^0\d{8,10}$/;
+
+    function isValidPhone(value) {
+        return e164Regex.test(value) || localRegex.test(value);
+    }
+
+    // Convert local Vietnamese number to E.164: 0399726129 -> +84399726129
+    function toE164(phone) {
+        if (e164Regex.test(phone)) return phone;
+        if (localRegex.test(phone)) return "+84" + phone.substring(1);
+        return phone;
+    }
 
     function validatePhoneInputs() {
         var phone1 = document.getElementById("phoneNumber");
         var phone2 = document.getElementById("phoneNumber2");
         var valid = true;
 
-        if (!phone1.value || !e164Regex.test(phone1.value)) {
+        if (!phone1.value || !isValidPhone(phone1.value.trim())) {
             phone1.classList.add("is-invalid");
             valid = false;
         } else {
             phone1.classList.remove("is-invalid");
         }
 
-        if (phone2.value && !e164Regex.test(phone2.value)) {
+        if (phone2.value && !isValidPhone(phone2.value.trim())) {
             phone2.classList.add("is-invalid");
             valid = false;
         } else {
@@ -288,10 +301,10 @@
         var campaignId = (document.getElementById("campaignId").value || "").trim();
         var campaignTitle = selectedCampaign ? selectedCampaign.title : "";
 
-        var phoneNumbers = [phone1];
+        var phoneNumbers = [toE164(phone1)];
         var contactNames = [name1];
         if (phone2) {
-            phoneNumbers.push(phone2);
+            phoneNumbers.push(toE164(phone2));
             contactNames.push(name2);
         }
 

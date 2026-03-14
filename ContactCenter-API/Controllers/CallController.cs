@@ -45,14 +45,16 @@ namespace ContactCenterPOC.Controllers
                 });
             }
 
-            foreach (var pn in callRequest.PhoneNumbers)
+            // Normalize phone numbers: accept local VN format (0xxx) and convert to E.164
+            for (int i = 0; i < callRequest.PhoneNumbers.Length; i++)
             {
-                if (!E164Regex.IsMatch(pn))
+                callRequest.PhoneNumbers[i] = NormalizePhoneNumber(callRequest.PhoneNumbers[i]);
+                if (!E164Regex.IsMatch(callRequest.PhoneNumbers[i]))
                 {
                     return BadRequest(new
                     {
                         error = "Invalid phone number",
-                        message = $"Phone number '{pn}' must be in E.164 format (e.g., +6591234567)"
+                        message = $"Phone number '{callRequest.PhoneNumbers[i]}' is not valid. Use local (0399726129) or E.164 (+84399726129)."
                     });
                 }
             }
@@ -119,6 +121,17 @@ namespace ContactCenterPOC.Controllers
                 status = "Call terminated",
                 callConnectionId
             });
+        }
+
+        /// <summary>
+        /// Normalize phone number: convert local Vietnamese format (0xxx) to E.164 (+84xxx).
+        /// </summary>
+        private static string NormalizePhoneNumber(string phone)
+        {
+            phone = phone.Trim();
+            if (phone.StartsWith("0") && phone.Length >= 9 && phone.Length <= 11)
+                return "+84" + phone.Substring(1);
+            return phone;
         }
 
         [HttpGet("active")]

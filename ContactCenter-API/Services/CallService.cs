@@ -109,15 +109,21 @@ namespace ContactCenterPOC.Services
 
         public async Task<List<(string callConnectionId, string phoneNumber)>> InitiateCall(string[] phoneNumbers, string? callContextPrompt, string? campaignId, string[]? contactNames, HttpContext httpContext)
         {
-            // Validate phone numbers
+            // Validate and normalize phone numbers
             if (phoneNumbers == null || phoneNumbers.Length == 0)
                 throw new ArgumentException("At least one phone number is required.");
             if (phoneNumbers.Length > 2)
                 throw new ArgumentException("Maximum of 2 phone numbers allowed.");
-            foreach (var pn in phoneNumbers)
+            for (int i = 0; i < phoneNumbers.Length; i++)
             {
+                // Convert local VN format (0xxx) to E.164 (+84xxx)
+                var pn = phoneNumbers[i].Trim();
+                if (pn.StartsWith("0") && pn.Length >= 9 && pn.Length <= 11)
+                    pn = "+84" + pn.Substring(1);
+                phoneNumbers[i] = pn;
+
                 if (!E164Regex.IsMatch(pn))
-                    throw new ArgumentException($"Phone number '{pn}' is not in E.164 format.");
+                    throw new ArgumentException($"Phone number '{pn}' is not valid.");
             }
 
             // Check concurrent limit
