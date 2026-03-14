@@ -123,12 +123,19 @@ namespace ContactCenterPOC.Services
             _logger.LogInformation("[AI-{CallId}] Connecting to OpenAI Realtime: endpoint={Endpoint}, deployment={Deployment}",
                 _callConnectionId, openAiUri, openAiModelName);
 
-            // Use DefaultAzureCredential (Managed Identity in Azure, developer credentials locally)
-            // because the Azure OpenAI resource has disableLocalAuth=true (API key auth disabled)
-            var credential = new DefaultAzureCredential();
-            _logger.LogInformation("[AI-{CallId}] Using DefaultAzureCredential (Managed Identity / Entra ID)", _callConnectionId);
-
-            var aiClient = new AzureOpenAIClient(new Uri(openAiUri), credential);
+            // Use API key if provided, otherwise fall back to DefaultAzureCredential (Managed Identity)
+            var apiKey = configuration["AzureOpenAI:Key"];
+            AzureOpenAIClient aiClient;
+            if (!string.IsNullOrEmpty(apiKey))
+            {
+                _logger.LogInformation("[AI-{CallId}] Using API Key authentication", _callConnectionId);
+                aiClient = new AzureOpenAIClient(new Uri(openAiUri), new System.ClientModel.ApiKeyCredential(apiKey));
+            }
+            else
+            {
+                _logger.LogInformation("[AI-{CallId}] Using DefaultAzureCredential (Managed Identity / Entra ID)", _callConnectionId);
+                aiClient = new AzureOpenAIClient(new Uri(openAiUri), new DefaultAzureCredential());
+            }
             var realtimeClient = aiClient.GetRealtimeConversationClient(openAiModelName);
             
             _logger.LogInformation("[AI-{CallId}] Starting conversation session...", _callConnectionId);

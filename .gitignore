@@ -394,6 +394,7 @@ FodyWeavers.xsd
 /api-appsettings.json
 
 # Downloaded log bundles and log directories
+logs/
 api-logs/
 api-logs-latest/
 api-logs-latest2/

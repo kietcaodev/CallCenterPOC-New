@@ -7,6 +7,12 @@ using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// File logging — daily rotating log files
+var logDir = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "logs");
+if (OperatingSystem.IsLinux())
+    logDir = "/opt/CallCenterPOC-New/logs";
+builder.Logging.AddFileLogger(logDir);
+
 // Bind VoiceLive configuration
 builder.Services.Configure<VoiceLiveConfig>(builder.Configuration.GetSection("VoiceLive"));
 builder.Services.AddSingleton(sp => sp.GetRequiredService<IOptions<VoiceLiveConfig>>().Value);
@@ -79,8 +85,10 @@ else if (!string.IsNullOrEmpty(blobAccountUri))
 }
 else
 {
-    // Fallback: in-memory BlobServiceClient (for testing / no blob config)
-    builder.Services.AddSingleton(new BlobServiceClient("UseDevelopmentStorage=true"));
+    // No blob storage configured — use a null-safe fallback
+    // CallHistoryService.SaveCallRecordAsync will catch and log errors gracefully
+    builder.Services.AddSingleton(new BlobServiceClient("DefaultEndpointsProtocol=https;AccountName=none;AccountKey=bm9uZQ==;BlobEndpoint=https://localhost:0"));
+    builder.Logging.AddFilter("Azure.Core", LogLevel.Error);
 }
 
 builder.Services.AddSingleton<CampaignService>();
