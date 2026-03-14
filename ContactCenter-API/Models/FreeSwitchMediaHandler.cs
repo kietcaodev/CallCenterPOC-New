@@ -2,7 +2,6 @@ using ContactCenterPOC.Hubs;
 using ContactCenterPOC.Services;
 using Microsoft.AspNetCore.SignalR;
 using System.Collections.Concurrent;
-using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Text;
 
@@ -32,6 +31,7 @@ namespace ContactCenterPOC.Models
         private readonly string? _voiceLiveModel;
         private readonly string? _selectedVoiceLiveVoice;
         private readonly VoiceLiveConfig? _voiceLiveConfig;
+        private readonly FreeSwitchService? _freeSwitchService;
 
         // Audio format: FreeSWITCH sends 16kHz, OpenAI expects 24kHz
         private const int FreeSwitchSampleRate = 16000;
@@ -55,7 +55,8 @@ namespace ContactCenterPOC.Models
             string voiceApiMode = "ChatGPT",
             string? voiceLiveModel = null,
             string? selectedVoiceLiveVoice = null,
-            VoiceLiveConfig? voiceLiveConfig = null)
+            VoiceLiveConfig? voiceLiveConfig = null,
+            FreeSwitchService? freeSwitchService = null)
         {
             _webSocket = webSocket;
             _configuration = configuration;
@@ -72,6 +73,7 @@ namespace ContactCenterPOC.Models
             _voiceLiveModel = voiceLiveModel;
             _selectedVoiceLiveVoice = selectedVoiceLiveVoice;
             _voiceLiveConfig = voiceLiveConfig;
+            _freeSwitchService = freeSwitchService;
         }
 
         /// <summary>
@@ -192,77 +194,27 @@ namespace ContactCenterPOC.Models
         }
 
         /// <summary>
-        /// Send uuid_broadcast command to FreeSWITCH via raw ESL TCP connection.
+        /// Play audio file on the call via FreeSwitchService ESL connection.
         /// </summary>
         private async Task EslBroadcastAsync(string filePath)
         {
-            var host = _configuration["FreeSWITCH:Host"];
-            if (string.IsNullOrEmpty(host)) host = "127.0.0.1";
-            var port = int.Parse(_configuration["FreeSWITCH:Port"] ?? "8021");
-            var password = _configuration["FreeSWITCH:Password"] ?? "ClueCon";
+            if (_freeSwitchService == null || !_freeSwitchService.IsConnected)
+            {
+                _logger.LogWarning("[FS-{CallId}] FreeSwitchService not available, cannot play audio", _callConnectionId);
+                return;
+            }
 
             try
             {
-                using var tcp = new TcpClient();
-                await tcp.ConnectAsync(host, port);
-                using var stream = tcp.GetStream();
-                using var reader = new StreamReader(stream, Encoding.UTF8);
-                using var writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
-
-                // Read auth/request
-                await ReadEslResponseAsync(reader);
-
-                // Authenticate
-                await writer.WriteAsync($"auth {password}\n\n");
-                await ReadEslResponseAsync(reader);
-
-                // Send uuid_broadcast command
-                var cmd = $"api uuid_broadcast {_callConnectionId} {filePath} aleg";
-                _logger.LogInformation("[FS-{CallId}] ESL: {Cmd}", _callConnectionId, cmd);
-                await writer.WriteAsync($"{cmd}\n\n");
-                var response = await ReadEslResponseAsync(reader);
-                _logger.LogInformation("[FS-{CallId}] ESL response: {Response}", _callConnectionId, response.TrimEnd());
+                _logger.LogInformation("[FS-{CallId}] ESL: uuid_broadcast {UUID} {Path} aleg",
+                    _callConnectionId, _callConnectionId, filePath);
+                await _freeSwitchService.PlayAudioAsync(_callConnectionId, filePath);
+                _logger.LogInformation("[FS-{CallId}] ESL uuid_broadcast sent successfully", _callConnectionId);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "[FS-{CallId}] ESL uuid_broadcast failed", _callConnectionId);
             }
-        }
-
-        /// <summary>
-        /// Read one ESL response (header block ending with double newline).
-        /// </summary>
-        private static async Task<string> ReadEslResponseAsync(StreamReader reader)
-        {
-            var sb = new StringBuilder();
-            string? line;
-            while ((line = await reader.ReadLineAsync()) != null)
-            {
-                if (line.Length == 0) break; // empty line = end of header block
-                sb.AppendLine(line);
-            }
-            // If Content-Length present, read body
-            var headers = sb.ToString();
-            var clPrefix = "Content-Length: ";
-            var clIndex = headers.IndexOf(clPrefix, StringComparison.OrdinalIgnoreCase);
-            if (clIndex >= 0)
-            {
-                var clEnd = headers.IndexOf('\n', clIndex);
-                var clStr = headers.Substring(clIndex + clPrefix.Length, clEnd - clIndex - clPrefix.Length).Trim();
-                if (int.TryParse(clStr, out var bodyLen) && bodyLen > 0)
-                {
-                    var buf = new char[bodyLen];
-                    var read = 0;
-                    while (read < bodyLen)
-                    {
-                        var n = await reader.ReadAsync(buf, read, bodyLen - read);
-                        if (n == 0) break;
-                        read += n;
-                    }
-                    sb.Append(buf, 0, read);
-                }
-            }
-            return sb.ToString();
         }
 
         /// <summary>

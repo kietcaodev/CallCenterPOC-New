@@ -36,8 +36,10 @@ namespace ContactCenterPOC.Services
         {
             Logger = logger;
 
-            var endpointUri = configuration["AzureOpenAI:EndpointUri"];
-            var apiKey = configuration["AzureOpenAI:Key"];
+            var endpointUri = configuration["AzureOpenAI:ChatEndpointUri"]
+                ?? configuration["AzureOpenAI:EndpointUri"];
+            var apiKey = configuration["AzureOpenAI:ChatKey"]
+                ?? configuration["AzureOpenAI:Key"];
 
             // Allow each service to specify a dedicated deployment config key (e.g., AzureOpenAI:SentimentDeployment)
             string? dedicatedDeployment = null;

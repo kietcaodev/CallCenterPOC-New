@@ -327,7 +327,8 @@ namespace ContactCenterPOC.Services
                 ws, _configuration, _logger, _hubContext,
                 callConnectionId, null,
                 _sentimentService, _activeCalls, _emotionService, selectedVoice,
-                voiceApiMode, voiceLiveModel, voiceLiveVoice, _voiceLiveConfig);
+                voiceApiMode, voiceLiveModel, voiceLiveVoice, _voiceLiveConfig,
+                _freeSwitchService);
             _mediaHandlers[callConnectionId] = handler;
 
             try
