@@ -198,18 +198,19 @@ namespace ContactCenterPOC.Models
         /// </summary>
         private async Task EslBroadcastAsync(string filePath)
         {
-            if (_freeSwitchService == null || !_freeSwitchService.IsConnected)
+            if (_freeSwitchService == null)
             {
-                _logger.LogWarning("[FS-{CallId}] FreeSwitchService not available, cannot play audio", _callConnectionId);
+                _logger.LogError("[FS-{CallId}] FreeSwitchService is NULL — was not injected", _callConnectionId);
                 return;
             }
 
+            _logger.LogInformation("[FS-{CallId}] ESL IsConnected={Connected}, calling PlayAudioAsync for {Path}",
+                _callConnectionId, _freeSwitchService.IsConnected, filePath);
+
             try
             {
-                _logger.LogInformation("[FS-{CallId}] ESL: uuid_broadcast {UUID} {Path} aleg",
-                    _callConnectionId, _callConnectionId, filePath);
-                await _freeSwitchService.PlayAudioAsync(_callConnectionId, filePath);
-                _logger.LogInformation("[FS-{CallId}] ESL uuid_broadcast sent successfully", _callConnectionId);
+                var result = await _freeSwitchService.PlayAudioAsync(_callConnectionId, filePath);
+                _logger.LogInformation("[FS-{CallId}] ESL uuid_broadcast result: {Result}", _callConnectionId, result);
             }
             catch (Exception ex)
             {

@@ -41,6 +41,13 @@ namespace ContactCenterPOC.Services
             var apiKey = configuration["AzureOpenAI:ChatKey"]
                 ?? configuration["AzureOpenAI:Key"];
 
+            logger.LogInformation("{ServiceName}: ChatEndpointUri={ChatEP}, fallback EndpointUri={EP}, ChatKey={HasChatKey}, fallback Key={HasKey}",
+                serviceName,
+                configuration["AzureOpenAI:ChatEndpointUri"] ?? "(null)",
+                configuration["AzureOpenAI:EndpointUri"] ?? "(null)",
+                !string.IsNullOrEmpty(configuration["AzureOpenAI:ChatKey"]) ? "set" : "not set",
+                !string.IsNullOrEmpty(configuration["AzureOpenAI:Key"]) ? "set" : "not set");
+
             // Allow each service to specify a dedicated deployment config key (e.g., AzureOpenAI:SentimentDeployment)
             string? dedicatedDeployment = null;
             if (!string.IsNullOrEmpty(deploymentConfigKey))

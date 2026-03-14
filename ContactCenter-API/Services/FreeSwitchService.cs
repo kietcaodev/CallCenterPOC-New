@@ -217,12 +217,29 @@ namespace ContactCenterPOC.Services
 
         /// <summary>
         /// Send audio file to FreeSWITCH for playback on the call.
+        /// Auto-reconnects if ESL connection is down.
         /// </summary>
-        public async Task PlayAudioAsync(string uuid, string filePath)
+        public async Task<string> PlayAudioAsync(string uuid, string filePath)
         {
-            if (_commandConn == null) return;
-            var cmd = $"uuid_broadcast {uuid} {filePath} aleg async";
-            await _commandConn.SendApi(cmd);
+            // Try reconnect if not connected
+            if (_commandConn == null)
+            {
+                _logger.LogWarning("PlayAudioAsync: ESL command connection is null, attempting reconnect...");
+                await ConnectAsync();
+            }
+
+            if (_commandConn == null)
+            {
+                _logger.LogError("PlayAudioAsync: ESL reconnect failed, cannot play audio for {UUID}", uuid);
+                return "-ERR not connected";
+            }
+
+            var cmd = $"uuid_broadcast {uuid} {filePath} aleg";
+            _logger.LogInformation("PlayAudioAsync: Sending ESL command: {Cmd}", cmd);
+            var result = await _commandConn.SendApi(cmd);
+            var body = result.BodyText?.Trim() ?? "(no body)";
+            _logger.LogInformation("PlayAudioAsync: ESL response: {Response}", body);
+            return body;
         }
 
         public bool IsConnected => _commandConn != null;
