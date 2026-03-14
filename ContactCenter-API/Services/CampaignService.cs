@@ -86,10 +86,7 @@ namespace ContactCenterPOC.Services
                 {
                     var response = await blobClient.DownloadContentAsync();
                     var json = response.Value.Content.ToString();
-                    _campaigns = JsonSerializer.Deserialize<List<Campaign>>(json, new JsonSerializerOptions
-                    {
-                        PropertyNameCaseInsensitive = true
-                    }) ?? new List<Campaign>();
+                    _campaigns = JsonSerializer.Deserialize<List<Campaign>>(json, _readOptions) ?? new List<Campaign>();
                     _logger.LogInformation("Loaded {Count} campaigns from Blob Storage", _campaigns.Count);
                 }
                 else

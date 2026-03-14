@@ -903,7 +903,7 @@
 
         // Start timer on Connected
         if (statusStr === "Connected" && !c.timerInterval) {
-            c.timerSeconds = 0;
+            if (!c.timerSeconds) c.timerSeconds = 0;
             c.timerInterval = setInterval(function () {
                 c.timerSeconds++;
                 if (callConnectionId === activeTabId) {
