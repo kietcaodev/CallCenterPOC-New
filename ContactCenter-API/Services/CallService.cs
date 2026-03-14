@@ -65,9 +65,9 @@ namespace ContactCenterPOC.Services
 
                 activeCall.Status = CallStatus.Connected;
 
-                // Start audio fork to stream call audio to our WebSocket endpoint
-                var wsUrl = _callbackUri.Replace("https://", "ws://").Replace("http://", "ws://") + "/ws?callId=" + uuid;
-                await _freeSwitchService.StartAudioForkAsync(uuid, wsUrl);
+                // Transfer call to the extension that runs mod_audio_stream dialplan.
+                // mod_audio_stream will connect to our WebSocket endpoint with callId=uuid.
+                await _freeSwitchService.TransferCallAsync(uuid);
 
                 await _hubContext.Clients.All.SendAsync("CallStatusChanged", new
                 {
@@ -78,7 +78,7 @@ namespace ContactCenterPOC.Services
                     campaignTitle = activeCall.CampaignTitle
                 });
 
-                _logger.LogInformation("FreeSWITCH call answered and audio fork started: {UUID}", uuid);
+                _logger.LogInformation("FreeSWITCH call answered and transferred: {UUID}", uuid);
             }
             catch (Exception ex)
             {
@@ -173,8 +173,8 @@ namespace ContactCenterPOC.Services
                     _logger.LogInformation("Call to {PhoneNumber} will greet contact as '{ContactName}'", targetPhoneNumber, contactName);
                 }
 
-                // Originate call via FreeSWITCH ESL (audio fork starts when CallAnswered event fires)
-                var callConnectionId = await _freeSwitchService.OriginateWithAudioForkAsync(targetPhoneNumber, _callbackUri);
+                // Originate call via FreeSWITCH ESL (transfer to mod_audio_stream on answer)
+                var callConnectionId = await _freeSwitchService.OriginateOutboundCallAsync(targetPhoneNumber);
 
                 var activeCall = new ActiveCall
                 {

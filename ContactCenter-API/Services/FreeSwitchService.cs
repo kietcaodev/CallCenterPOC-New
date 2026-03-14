@@ -96,35 +96,35 @@ namespace ContactCenterPOC.Services
         }
 
         /// <summary>
-        /// Originate an outbound call via SIP trunk and fork audio to WebSocket.
+        /// Originate an outbound call via SIP trunk.
+        /// The call is parked on answer; HandleCallAnsweredAsync will transfer it.
         /// Returns the call UUID.
         /// </summary>
-        public async Task<string> OriginateCallAsync(string targetPhoneNumber, string webSocketUrl)
+        public async Task<string> OriginateOutboundCallAsync(string targetPhoneNumber)
         {
             if (_commandConn == null)
                 throw new InvalidOperationException("FreeSWITCH not connected");
 
             var gateway = _configuration["FreeSWITCH:SipGateway"] ?? "default";
+            var dialPrefix = _configuration["FreeSWITCH:DialPrefix"] ?? "";
             var callerIdNumber = _configuration["FreeSWITCH:CallerIdNumber"] ?? "0000000000";
-            var callerIdName = _configuration["FreeSWITCH:CallerIdName"] ?? "AI Contact Center";
+            var callerIdName = _configuration["FreeSWITCH:CallerIdName"] ?? callerIdNumber;
 
-            // Strip + prefix for SIP dialing if needed
-            var dialNumber = targetPhoneNumber.TrimStart('+');
-
-            // Generate a UUID for tracking
+            // Convert E.164 (+84399726129) to local format (0399726129)
+            var localNumber = ConvertToLocalNumber(targetPhoneNumber);
+            var dialString = $"{dialPrefix}{localNumber}";
             var uuid = Guid.NewGuid().ToString();
 
-            // Originate with audio fork to WebSocket
-            // The call will be parked (&park) and audio forked to our WebSocket endpoint
             var originateCmd = $"originate " +
                 $"{{origination_uuid={uuid}," +
                 $"origination_caller_id_number={callerIdNumber}," +
                 $"origination_caller_id_name={callerIdName}," +
-                $"execute_on_answer='socket:{webSocketUrl} async full'" +
-                $"}}sofia/gateway/{gateway}/{dialNumber} &park()";
+                $"effective_caller_id_number={callerIdNumber}," +
+                $"effective_caller_id_name={callerIdName}" +
+                $"}}sofia/gateway/{gateway}/{dialString} &park()";
 
-            _logger.LogInformation("Originating call: uuid={UUID}, target={Target}, gateway={Gateway}",
-                uuid, targetPhoneNumber, gateway);
+            _logger.LogInformation("Originating outbound call: uuid={UUID}, target={Target}, dial={Dial}, gateway={Gateway}",
+                uuid, targetPhoneNumber, dialString, gateway);
 
             var result = await _commandConn.SendApi(originateCmd);
             var body = result.BodyText?.Trim() ?? "";
@@ -143,54 +143,35 @@ namespace ContactCenterPOC.Services
         }
 
         /// <summary>
-        /// Originate call using audio_fork for WebSocket streaming (mod_audio_fork).
-        /// This approach dials the call normally, then forks audio to WS.
+        /// Transfer a call to an extension (e.g., 1800123456 which runs mod_audio_stream dialplan).
         /// </summary>
-        public async Task<string> OriginateWithAudioForkAsync(string targetPhoneNumber, string webSocketUrl)
+        public async Task TransferCallAsync(string uuid, string? targetExtension = null)
         {
             if (_commandConn == null)
                 throw new InvalidOperationException("FreeSWITCH not connected");
 
-            var gateway = _configuration["FreeSWITCH:SipGateway"] ?? "default";
-            var callerIdNumber = _configuration["FreeSWITCH:CallerIdNumber"] ?? "0000000000";
-            var callerIdName = _configuration["FreeSWITCH:CallerIdName"] ?? "AI Contact Center";
-            var dialNumber = targetPhoneNumber.TrimStart('+');
-            var uuid = Guid.NewGuid().ToString();
+            var target = targetExtension ?? _configuration["FreeSWITCH:TransferTarget"] ?? "1800123456";
+            var cmd = $"uuid_transfer {uuid} {target}";
+            _logger.LogInformation("Transferring call {UUID} to {Target}", uuid, target);
 
-            // Step 1: Originate the call to park
-            var originateCmd = $"originate " +
-                $"{{origination_uuid={uuid}," +
-                $"origination_caller_id_number={callerIdNumber}," +
-                $"origination_caller_id_name={callerIdName}" +
-                $"}}sofia/gateway/{gateway}/{dialNumber} &park()";
-
-            _logger.LogInformation("Originating call with audio fork: uuid={UUID}, target={Target}", uuid, targetPhoneNumber);
-
-            var result = await _commandConn.SendApi(originateCmd);
+            var result = await _commandConn.SendApi(cmd);
             var body = result.BodyText?.Trim() ?? "";
-
-            if (!body.StartsWith("+OK"))
-            {
-                throw new InvalidOperationException($"FreeSWITCH originate failed: {body}");
-            }
-
-            return uuid;
+            _logger.LogInformation("Transfer result for {UUID}: {Result}", uuid, body);
         }
 
         /// <summary>
-        /// Start audio fork on an existing call, streaming to WebSocket endpoint.
+        /// Convert E.164 phone number to local Vietnamese format.
+        /// +84399726129 → 0399726129
         /// </summary>
-        public async Task StartAudioForkAsync(string uuid, string webSocketUrl)
+        private string ConvertToLocalNumber(string e164Number)
         {
-            if (_commandConn == null)
-                throw new InvalidOperationException("FreeSWITCH not connected");
-
-            // uuid_audio_fork <uuid> start <ws://url> mono 16000
-            var cmd = $"uuid_audio_fork {uuid} start {webSocketUrl} mono 16000";
-            _logger.LogInformation("Starting audio fork: {UUID} -> {WsUrl}", uuid, webSocketUrl);
-
-            var result = await _commandConn.SendApi(cmd);
-            _logger.LogInformation("Audio fork result: {Result}", result.BodyText?.Trim());
+            var countryCode = _configuration["FreeSWITCH:CountryCode"] ?? "84";
+            var stripped = e164Number.TrimStart('+');
+            if (stripped.StartsWith(countryCode))
+            {
+                return "0" + stripped.Substring(countryCode.Length);
+            }
+            return stripped;
         }
 
         /// <summary>
