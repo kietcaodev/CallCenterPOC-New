@@ -213,7 +213,8 @@ namespace ContactCenterPOC.Services
         {
             if (string.IsNullOrWhiteSpace(responseBody)) return false;
             return responseBody.IndexOf("Unsupported parameter", StringComparison.OrdinalIgnoreCase) >= 0
-                || responseBody.IndexOf("does not support", StringComparison.OrdinalIgnoreCase) >= 0;
+                || responseBody.IndexOf("does not support", StringComparison.OrdinalIgnoreCase) >= 0
+                || responseBody.IndexOf("Unrecognized request argument", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         protected static string? ExtractAssistantContent(string responseBody)
