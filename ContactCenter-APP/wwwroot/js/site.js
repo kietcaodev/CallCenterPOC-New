@@ -22,7 +22,10 @@
     var kpiState = loadKpiState();
 
     var apiBaseUrl = function () {
-        return (document.getElementById("apiBaseUrl") || {}).value || "";
+        var configured = (document.getElementById("apiBaseUrl") || {}).value || "";
+        if (configured) return configured;
+        // Auto-detect: same host, API on port 5223
+        return window.location.protocol + "//" + window.location.hostname + ":5223";
     };
 
     // ═══════════════════════════════════════════════════════════
