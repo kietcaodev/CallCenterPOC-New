@@ -3,12 +3,13 @@ Description=CallCenter POC - API
 After=network.target freeswitch.service
 
 [Service]
-Type=notify
+Type=simple
 WorkingDirectory=/opt/CallCenterPOC-New/ContactCenter-API
-ExecStart=/usr/bin/dotnet run --no-build --urls "http://0.0.0.0:5223"
+ExecStart=/usr/bin/dotnet run --no-build --configuration Release --urls "http://0.0.0.0:5223"
 Restart=always
 RestartSec=5
 Environment=ASPNETCORE_ENVIRONMENT=Production
+Environment=ASPNETCORE_URLS=http://0.0.0.0:5223
 Environment=DOTNET_PRINT_TELEMETRY_MESSAGE=false
 
 [Install]

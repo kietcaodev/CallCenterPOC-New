@@ -3,12 +3,13 @@ Description=CallCenter POC - Web APP
 After=network.target callcenter-api.service
 
 [Service]
-Type=notify
+Type=simple
 WorkingDirectory=/opt/CallCenterPOC-New/ContactCenter-APP
-ExecStart=/usr/bin/dotnet run --no-build --urls "http://0.0.0.0:5295"
+ExecStart=/usr/bin/dotnet run --no-build --configuration Release --urls "http://0.0.0.0:5295"
 Restart=always
 RestartSec=5
 Environment=ASPNETCORE_ENVIRONMENT=Production
+Environment=ASPNETCORE_URLS=http://0.0.0.0:5295
 Environment=DOTNET_PRINT_TELEMETRY_MESSAGE=false
 
 [Install]
