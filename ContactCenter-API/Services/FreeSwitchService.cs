@@ -97,7 +97,8 @@ namespace ContactCenterPOC.Services
 
         /// <summary>
         /// Originate an outbound call via SIP trunk.
-        /// When customer answers, FreeSWITCH auto-transfers to the mod_audio_stream dialplan.
+        /// When customer answers, FreeSWITCH executes the transfer target dialplan (mod_audio_stream).
+        /// Uses standard originate format to preserve origination_uuid through the call.
         /// Returns the call UUID.
         /// </summary>
         public async Task<string> OriginateOutboundCallAsync(string targetPhoneNumber)
@@ -110,23 +111,25 @@ namespace ContactCenterPOC.Services
             var callerIdNumber = _configuration["FreeSWITCH:CallerIdNumber"] ?? "0000000000";
             var callerIdName = _configuration["FreeSWITCH:CallerIdName"] ?? callerIdNumber;
             var transferTarget = _configuration["FreeSWITCH:TransferTarget"] ?? "1800123456";
-            var transferContext = _configuration["FreeSWITCH:TransferContext"] ?? "default";
+            var transferContext = _configuration["FreeSWITCH:TransferContext"] ?? "public";
 
             // Convert E.164 (+84399726129) to local format (0399726129)
             var localNumber = ConvertToLocalNumber(targetPhoneNumber);
             var dialString = $"{dialPrefix}{localNumber}";
             var uuid = Guid.NewGuid().ToString();
 
-            // When customer answers, auto-transfer to the dialplan that runs mod_audio_stream
+            // Standard originate format: when customer answers, execute extension in dialplan context.
+            // This preserves origination_uuid as the channel UUID so ${uuid} in dialplan matches our ActiveCall.
             var originateCmd = $"originate " +
                 $"{{origination_uuid={uuid}," +
+                $"absolute_codec_string=PCMU,PCMA," +
                 $"origination_caller_id_number={callerIdNumber}," +
                 $"origination_caller_id_name={callerIdName}," +
                 $"effective_caller_id_number={callerIdNumber}," +
                 $"effective_caller_id_name={callerIdName}" +
-                $"}}sofia/gateway/{gateway}/{dialString} &transfer({transferTarget} XML {transferContext})";
+                $"}}sofia/gateway/{gateway}/{dialString} {transferTarget} XML {transferContext} '{callerIdName}' '{callerIdNumber}'";
 
-            _logger.LogInformation("Originating outbound call: uuid={UUID}, target={Target}, dial={Dial}, gateway={Gateway}, transfer={Transfer}@{Context}",
+            _logger.LogInformation("Originating outbound call: uuid={UUID}, target={Target}, dial={Dial}, gateway={Gateway}, extension={Transfer}@{Context}",
                 uuid, targetPhoneNumber, dialString, gateway, transferTarget, transferContext);
 
             var result = await _commandConn.SendApi(originateCmd);
