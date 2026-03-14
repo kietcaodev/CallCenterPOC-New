@@ -63,15 +63,13 @@ namespace ContactCenterPOC.Services
             {
                 if (!_activeCalls.TryGetValue(uuid, out var activeCall)) return;
 
-                // Guard: skip if already connected (avoid double-transfer)
+                // Guard: skip if already connected (StartCallInteraction also sets Connected)
                 if (activeCall.Status == CallStatus.Connected) return;
 
                 activeCall.Status = CallStatus.Connected;
 
-                // Transfer call to the extension that runs mod_audio_stream/mod_audio_fork dialplan.
-                // The dialplan runs uuid_audio_fork which connects WebSocket to our API with callId=uuid.
-                await _freeSwitchService.TransferCallAsync(uuid);
-
+                // No transfer needed here — originate uses &transfer() to auto-route on answer.
+                // Just update UI status.
                 await _hubContext.Clients.All.SendAsync("CallStatusChanged", new
                 {
                     callConnectionId = uuid,
@@ -81,7 +79,7 @@ namespace ContactCenterPOC.Services
                     campaignTitle = activeCall.CampaignTitle
                 });
 
-                _logger.LogInformation("FreeSWITCH call answered and transferred: {UUID}", uuid);
+                _logger.LogInformation("FreeSWITCH call answered: {UUID}", uuid);
             }
             catch (Exception ex)
             {

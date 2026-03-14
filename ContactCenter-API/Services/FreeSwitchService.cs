@@ -97,7 +97,7 @@ namespace ContactCenterPOC.Services
 
         /// <summary>
         /// Originate an outbound call via SIP trunk.
-        /// The call is parked on answer; HandleCallAnsweredAsync will transfer it.
+        /// When customer answers, FreeSWITCH auto-transfers to the mod_audio_stream dialplan.
         /// Returns the call UUID.
         /// </summary>
         public async Task<string> OriginateOutboundCallAsync(string targetPhoneNumber)
@@ -109,22 +109,25 @@ namespace ContactCenterPOC.Services
             var dialPrefix = _configuration["FreeSWITCH:DialPrefix"] ?? "";
             var callerIdNumber = _configuration["FreeSWITCH:CallerIdNumber"] ?? "0000000000";
             var callerIdName = _configuration["FreeSWITCH:CallerIdName"] ?? callerIdNumber;
+            var transferTarget = _configuration["FreeSWITCH:TransferTarget"] ?? "1800123456";
+            var transferContext = _configuration["FreeSWITCH:TransferContext"] ?? "default";
 
             // Convert E.164 (+84399726129) to local format (0399726129)
             var localNumber = ConvertToLocalNumber(targetPhoneNumber);
             var dialString = $"{dialPrefix}{localNumber}";
             var uuid = Guid.NewGuid().ToString();
 
+            // When customer answers, auto-transfer to the dialplan that runs mod_audio_stream
             var originateCmd = $"originate " +
                 $"{{origination_uuid={uuid}," +
                 $"origination_caller_id_number={callerIdNumber}," +
                 $"origination_caller_id_name={callerIdName}," +
                 $"effective_caller_id_number={callerIdNumber}," +
                 $"effective_caller_id_name={callerIdName}" +
-                $"}}sofia/gateway/{gateway}/{dialString} &park()";
+                $"}}sofia/gateway/{gateway}/{dialString} &transfer({transferTarget} XML {transferContext})";
 
-            _logger.LogInformation("Originating outbound call: uuid={UUID}, target={Target}, dial={Dial}, gateway={Gateway}",
-                uuid, targetPhoneNumber, dialString, gateway);
+            _logger.LogInformation("Originating outbound call: uuid={UUID}, target={Target}, dial={Dial}, gateway={Gateway}, transfer={Transfer}@{Context}",
+                uuid, targetPhoneNumber, dialString, gateway, transferTarget, transferContext);
 
             var result = await _commandConn.SendApi(originateCmd);
             var body = result.BodyText?.Trim() ?? "";
