@@ -63,10 +63,13 @@ namespace ContactCenterPOC.Services
             {
                 if (!_activeCalls.TryGetValue(uuid, out var activeCall)) return;
 
+                // Guard: skip if already connected (avoid double-transfer)
+                if (activeCall.Status == CallStatus.Connected) return;
+
                 activeCall.Status = CallStatus.Connected;
 
-                // Transfer call to the extension that runs mod_audio_stream dialplan.
-                // mod_audio_stream will connect to our WebSocket endpoint with callId=uuid.
+                // Transfer call to the extension that runs mod_audio_stream/mod_audio_fork dialplan.
+                // The dialplan runs uuid_audio_fork which connects WebSocket to our API with callId=uuid.
                 await _freeSwitchService.TransferCallAsync(uuid);
 
                 await _hubContext.Clients.All.SendAsync("CallStatusChanged", new
