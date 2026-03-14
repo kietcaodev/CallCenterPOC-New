@@ -255,7 +255,7 @@ namespace ContactCenterPOC.Services
                         }
                         else
                         {
-                            _logger.LogWarning("[AI-{CallId}] Received delta update but AudioBytes is null", _callConnectionId);
+                            _logger.LogDebug("[AI-{CallId}] Received text-only delta (no audio bytes)", _callConnectionId);
                         }
                     }
 
@@ -294,6 +294,8 @@ namespace ContactCenterPOC.Services
                     {
                         _logger.LogInformation("[AI-{CallId}] Model turn generation finished. Status: {Status}. Total audio chunks sent: {ChunkCount}", 
                             _callConnectionId, turnFinishedUpdate.Status, audioChunkCount);
+                        // Signal the media handler to flush buffered audio (plays via ESL for FreeSWITCH)
+                        await m_mediaStreaming.FlushAudioAsync();
                     }
 
                     if (update is ConversationErrorUpdate errorUpdate)

@@ -7,5 +7,6 @@ namespace ContactCenterPOC.Models
     public interface IMediaStreamingHandler
     {
         Task SendMessageAsync(string message);
+        Task FlushAudioAsync() => Task.CompletedTask;
     }
 }

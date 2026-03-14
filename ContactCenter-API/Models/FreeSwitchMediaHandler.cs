@@ -2,7 +2,9 @@ using ContactCenterPOC.Hubs;
 using ContactCenterPOC.Services;
 using Microsoft.AspNetCore.SignalR;
 using System.Collections.Concurrent;
+using System.Net.Sockets;
 using System.Net.WebSockets;
+using System.Text;
 
 namespace ContactCenterPOC.Models
 {
@@ -34,6 +36,10 @@ namespace ContactCenterPOC.Models
         // Audio format: FreeSWITCH sends 16kHz, OpenAI expects 24kHz
         private const int FreeSwitchSampleRate = 16000;
         private const int OpenAiSampleRate = 24000;
+
+        // Buffer to accumulate audio chunks per AI turn, then play via ESL
+        private readonly MemoryStream _audioBuffer = new();
+        private int _turnCounter;
 
         public FreeSwitchMediaHandler(
             WebSocket webSocket,
@@ -127,41 +133,159 @@ namespace ContactCenterPOC.Models
         }
 
         /// <summary>
-        /// Send resampled audio message back to FreeSWITCH via WebSocket.
-        /// mod_audio_stream expects a JSON text frame with type "streamAudio" and base64-encoded PCM.
-        /// Called by AI services that produce 24kHz PCM wrapped in ACS JSON format.
-        /// We intercept, extract audio, resample, and send as JSON text.
+        /// Buffer resampled audio from AI for later playback via ESL uuid_broadcast.
+        /// Called by AI services per audio chunk. Audio is accumulated until FlushAudioAsync.
         /// </summary>
         public async Task SendMessageAsync(string acsJsonMessage)
         {
-            if (_webSocket?.State != WebSocketState.Open) return;
-
             try
             {
-                // The AI services use OutStreamingData.GetAudioDataForOutbound() which produces
-                // an ACS-format JSON with base64 audio. We need to extract and resample.
                 var audioBytes = ExtractAudioFromAcsJson(acsJsonMessage);
                 if (audioBytes != null && audioBytes.Length > 0)
                 {
                     // Resample 24kHz → 16kHz for FreeSWITCH
                     var resampled = AudioResampler.Downsample24kTo16k(audioBytes);
-
-                    // mod_audio_stream expects JSON text: {"type":"streamAudio","data":{"audioDataType":"raw","sampleRate":16000,"audioData":"<base64>"}}
-                    var base64Audio = Convert.ToBase64String(resampled);
-                    var json = $"{{\"type\":\"streamAudio\",\"data\":{{\"audioDataType\":\"raw\",\"sampleRate\":16000,\"audioData\":\"{base64Audio}\"}}}}";
-                    var jsonBytes = System.Text.Encoding.UTF8.GetBytes(json);
-
-                    await _webSocket.SendAsync(
-                        new ArraySegment<byte>(jsonBytes),
-                        WebSocketMessageType.Text,
-                        endOfMessage: true,
-                        CancellationToken.None);
+                    _audioBuffer.Write(resampled, 0, resampled.Length);
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "[FS-{CallId}] Failed to send audio to FreeSWITCH", _callConnectionId);
+                _logger.LogError(ex, "[FS-{CallId}] Failed to buffer audio", _callConnectionId);
             }
+            await Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// Write buffered audio to a WAV file and play it back to the caller via ESL uuid_broadcast.
+        /// Called when AI finishes generating one turn of audio.
+        /// </summary>
+        public async Task FlushAudioAsync()
+        {
+            if (_audioBuffer.Length == 0) return;
+
+            var pcmData = _audioBuffer.ToArray();
+            _audioBuffer.SetLength(0);
+            _turnCounter++;
+
+            // Write WAV file to /tmp/
+            var fileName = $"ai_{_callConnectionId}_{_turnCounter}.wav";
+            var filePath = Path.Combine(Path.GetTempPath(), fileName);
+
+            try
+            {
+                await using (var fs = new FileStream(filePath, FileMode.Create, FileAccess.Write))
+                {
+                    WriteWavHeader(fs, pcmData.Length, 16000, 1, 16);
+                    await fs.WriteAsync(pcmData);
+                }
+
+                _logger.LogInformation("[FS-{CallId}] Wrote audio turn #{Turn} ({Bytes} bytes) to {Path}",
+                    _callConnectionId, _turnCounter, pcmData.Length, filePath);
+
+                // Play via ESL uuid_broadcast
+                await EslBroadcastAsync(filePath);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[FS-{CallId}] Failed to flush audio turn #{Turn}", _callConnectionId, _turnCounter);
+            }
+        }
+
+        /// <summary>
+        /// Send uuid_broadcast command to FreeSWITCH via raw ESL TCP connection.
+        /// </summary>
+        private async Task EslBroadcastAsync(string filePath)
+        {
+            var host = _configuration["FreeSWITCH:Host"];
+            if (string.IsNullOrEmpty(host)) host = "127.0.0.1";
+            var port = int.Parse(_configuration["FreeSWITCH:Port"] ?? "8021");
+            var password = _configuration["FreeSWITCH:Password"] ?? "ClueCon";
+
+            try
+            {
+                using var tcp = new TcpClient();
+                await tcp.ConnectAsync(host, port);
+                using var stream = tcp.GetStream();
+                using var reader = new StreamReader(stream, Encoding.UTF8);
+                using var writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
+
+                // Read auth/request
+                await ReadEslResponseAsync(reader);
+
+                // Authenticate
+                await writer.WriteAsync($"auth {password}\n\n");
+                await ReadEslResponseAsync(reader);
+
+                // Send uuid_broadcast command
+                var cmd = $"api uuid_broadcast {_callConnectionId} {filePath} aleg";
+                _logger.LogInformation("[FS-{CallId}] ESL: {Cmd}", _callConnectionId, cmd);
+                await writer.WriteAsync($"{cmd}\n\n");
+                var response = await ReadEslResponseAsync(reader);
+                _logger.LogInformation("[FS-{CallId}] ESL response: {Response}", _callConnectionId, response.TrimEnd());
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[FS-{CallId}] ESL uuid_broadcast failed", _callConnectionId);
+            }
+        }
+
+        /// <summary>
+        /// Read one ESL response (header block ending with double newline).
+        /// </summary>
+        private static async Task<string> ReadEslResponseAsync(StreamReader reader)
+        {
+            var sb = new StringBuilder();
+            string? line;
+            while ((line = await reader.ReadLineAsync()) != null)
+            {
+                if (line.Length == 0) break; // empty line = end of header block
+                sb.AppendLine(line);
+            }
+            // If Content-Length present, read body
+            var headers = sb.ToString();
+            var clPrefix = "Content-Length: ";
+            var clIndex = headers.IndexOf(clPrefix, StringComparison.OrdinalIgnoreCase);
+            if (clIndex >= 0)
+            {
+                var clEnd = headers.IndexOf('\n', clIndex);
+                var clStr = headers.Substring(clIndex + clPrefix.Length, clEnd - clIndex - clPrefix.Length).Trim();
+                if (int.TryParse(clStr, out var bodyLen) && bodyLen > 0)
+                {
+                    var buf = new char[bodyLen];
+                    var read = 0;
+                    while (read < bodyLen)
+                    {
+                        var n = await reader.ReadAsync(buf, read, bodyLen - read);
+                        if (n == 0) break;
+                        read += n;
+                    }
+                    sb.Append(buf, 0, read);
+                }
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// Write a standard PCM WAV header.
+        /// </summary>
+        private static void WriteWavHeader(Stream stream, int dataLength, int sampleRate, int channels, int bitsPerSample)
+        {
+            var byteRate = sampleRate * channels * bitsPerSample / 8;
+            var blockAlign = (short)(channels * bitsPerSample / 8);
+            using var bw = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
+            bw.Write(Encoding.ASCII.GetBytes("RIFF"));
+            bw.Write(36 + dataLength); // file size - 8
+            bw.Write(Encoding.ASCII.GetBytes("WAVE"));
+            bw.Write(Encoding.ASCII.GetBytes("fmt "));
+            bw.Write(16); // PCM chunk size
+            bw.Write((short)1); // PCM format
+            bw.Write((short)channels);
+            bw.Write(sampleRate);
+            bw.Write(byteRate);
+            bw.Write(blockAlign);
+            bw.Write((short)bitsPerSample);
+            bw.Write(Encoding.ASCII.GetBytes("data"));
+            bw.Write(dataLength);
         }
 
         /// <summary>
