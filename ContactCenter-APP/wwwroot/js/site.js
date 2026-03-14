@@ -376,7 +376,7 @@
         });
 
         connection.on("CallStatusChanged", function (update) {
-            handleCallStatus(update.callConnectionId, update.status);
+            handleCallStatus(update.callConnectionId, update.status, update);
         });
 
         connection.on("SentimentUpdate", function (data) {
@@ -833,9 +833,19 @@
     }
 
     // ─── Call Status ─────────────────────────────────────────
-    function handleCallStatus(callConnectionId, status) {
+    function handleCallStatus(callConnectionId, status, update) {
         var c = calls[callConnectionId];
-        if (!c) return;
+        if (!c) {
+            // Auto-register inbound/external calls not initiated from UI
+            var phone = (update && update.phoneNumber) || "Inbound";
+            var campaign = (update && update.campaignTitle) || "";
+            registerCall(callConnectionId, phone, campaign);
+            // Join SignalR group to receive transcripts/sentiment
+            if (connection && connection.state === signalR.HubConnectionState.Connected) {
+                connection.invoke("JoinCall", callConnectionId);
+            }
+            c = calls[callConnectionId];
+        }
 
         var statusStr = typeof status === "number"
             ? ["Initiating", "Ringing", "Connected", "Disconnected", "Failed", "Reconnecting"][status]
