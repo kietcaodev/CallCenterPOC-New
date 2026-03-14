@@ -127,9 +127,10 @@ namespace ContactCenterPOC.Models
         }
 
         /// <summary>
-        /// Send resampled audio message back to FreeSWITCH via WebSocket (binary).
+        /// Send resampled audio message back to FreeSWITCH via WebSocket.
+        /// mod_audio_stream expects a JSON text frame with type "streamAudio" and base64-encoded PCM.
         /// Called by AI services that produce 24kHz PCM wrapped in ACS JSON format.
-        /// We intercept, extract audio, resample, and send as binary.
+        /// We intercept, extract audio, resample, and send as JSON text.
         /// </summary>
         public async Task SendMessageAsync(string acsJsonMessage)
         {
@@ -144,9 +145,15 @@ namespace ContactCenterPOC.Models
                 {
                     // Resample 24kHz → 16kHz for FreeSWITCH
                     var resampled = AudioResampler.Downsample24kTo16k(audioBytes);
+
+                    // mod_audio_stream expects JSON text: {"type":"streamAudio","data":{"audioDataType":"raw","sampleRate":16000,"audioData":"<base64>"}}
+                    var base64Audio = Convert.ToBase64String(resampled);
+                    var json = $"{{\"type\":\"streamAudio\",\"data\":{{\"audioDataType\":\"raw\",\"sampleRate\":16000,\"audioData\":\"{base64Audio}\"}}}}";
+                    var jsonBytes = System.Text.Encoding.UTF8.GetBytes(json);
+
                     await _webSocket.SendAsync(
-                        new ArraySegment<byte>(resampled),
-                        WebSocketMessageType.Binary,
+                        new ArraySegment<byte>(jsonBytes),
+                        WebSocketMessageType.Text,
                         endOfMessage: true,
                         CancellationToken.None);
                 }
