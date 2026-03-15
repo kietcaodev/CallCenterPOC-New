@@ -257,11 +257,18 @@ namespace ContactCenterPOC.Models
             try
             {
                 // Wait for call to be answered before first broadcast
-                // (mod_audio_stream connects during ringing, but uuid_broadcast needs answered channel)
+                // (mod_audio_stream connects during early media, but uuid_broadcast needs answered channel)
                 if (!_callAnsweredTcs.Task.IsCompleted)
                 {
                     _logger.LogInformation("[FS-{CallId}] Waiting for call answer before playback...", _callConnectionId);
-                    await Task.WhenAny(_callAnsweredTcs.Task, Task.Delay(30000, _cts.Token));
+                    var timeout = Task.Delay(10000, _cts.Token);
+                    await Task.WhenAny(_callAnsweredTcs.Task, timeout);
+                    if (!_callAnsweredTcs.Task.IsCompleted)
+                    {
+                        // Timeout: audio is flowing so call must be answered; prevent future waits
+                        _logger.LogWarning("[FS-{CallId}] No call-answer signal after 10s, enabling playback anyway", _callConnectionId);
+                        _callAnsweredTcs.TrySetResult(true);
+                    }
                 }
 
                 while (_playbackQueue.TryDequeue(out var item))

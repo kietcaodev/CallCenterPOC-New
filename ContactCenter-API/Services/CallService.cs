@@ -27,6 +27,8 @@ namespace ContactCenterPOC.Services
         // Thread-safe dictionaries for concurrent call handling
         private readonly ConcurrentDictionary<string, ActiveCall> _activeCalls = new();
         private readonly ConcurrentDictionary<string, FreeSwitchMediaHandler> _mediaHandlers = new();
+        // Track UUIDs that received ChannelAnswer before handler was registered (race condition)
+        private readonly ConcurrentDictionary<string, byte> _answeredBeforeHandler = new();
 
         public ConcurrentDictionary<string, ActiveCall> ActiveCalls => _activeCalls;
 
@@ -65,6 +67,11 @@ namespace ContactCenterPOC.Services
                 if (_mediaHandlers.TryGetValue(uuid, out var handler))
                 {
                     handler.NotifyCallAnswered();
+                }
+                else
+                {
+                    // Handler not registered yet — record so StartCallInteraction can notify later
+                    _answeredBeforeHandler[uuid] = 1;
                 }
 
                 if (!_activeCalls.TryGetValue(uuid, out var activeCall)) return;
@@ -353,8 +360,8 @@ namespace ContactCenterPOC.Services
                 _freeSwitchService);
             _mediaHandlers[callConnectionId] = handler;
 
-            // If call was already answered (fast answer or inbound), enable playback immediately
-            if (activeCall.Status == CallStatus.Connected)
+            // If call was already answered (fast answer, race with ChannelAnswer event), enable playback
+            if (activeCall.Status == CallStatus.Connected || _answeredBeforeHandler.TryRemove(callConnectionId, out _))
             {
                 handler.NotifyCallAnswered();
             }
