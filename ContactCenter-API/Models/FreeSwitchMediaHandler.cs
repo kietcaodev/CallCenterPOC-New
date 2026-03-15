@@ -45,6 +45,12 @@ namespace ContactCenterPOC.Models
         private readonly ConcurrentQueue<(string filePath, int pcmBytes)> _playbackQueue = new();
         private int _playbackRunning; // 0 = idle, 1 = running
 
+        // Gate playback until call is actually answered (mod_audio_stream connects during ringing)
+        private readonly TaskCompletionSource<bool> _callAnsweredTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // True while uuid_broadcast is playing — mutes upstream audio to prevent echo
+        private volatile bool _isPlayingBack;
+
         public FreeSwitchMediaHandler(
             WebSocket webSocket,
             IConfiguration configuration,
@@ -78,6 +84,15 @@ namespace ContactCenterPOC.Models
             _selectedVoiceLiveVoice = selectedVoiceLiveVoice;
             _voiceLiveConfig = voiceLiveConfig;
             _freeSwitchService = freeSwitchService;
+        }
+
+        /// <summary>
+        /// Signal that the call has been answered. Unblocks audio playback.
+        /// </summary>
+        public void NotifyCallAnswered()
+        {
+            _logger.LogInformation("[FS-{CallId}] Call answered — playback enabled", _callConnectionId);
+            _callAnsweredTcs.TrySetResult(true);
         }
 
         /// <summary>
@@ -148,6 +163,7 @@ namespace ContactCenterPOC.Models
                 // Handle barge-in: stop current playback when user starts speaking
                 if (IsStopAudioMessage(acsJsonMessage))
                 {
+                    _isPlayingBack = false; // Resume upstream audio to OpenAI
                     _audioBuffer.SetLength(0);
                     // Clear any queued turns and stop current playback
                     while (_playbackQueue.TryDequeue(out _)) { }
@@ -212,25 +228,38 @@ namespace ContactCenterPOC.Models
 
         /// <summary>
         /// Process queued audio files sequentially: play one, wait for its duration, then play next.
-        /// No need to pause/resume stream — uuid_displace mw plays on WRITE only,
-        /// so mod_audio_stream (READ) doesn't capture playback audio.
+        /// Mutes upstream mic audio during playback to prevent echo from mod_audio_stream
+        /// feeding uuid_broadcast audio back to OpenAI (which would trigger false VAD → incomplete responses).
         /// </summary>
         private async Task ProcessPlaybackQueueAsync()
         {
             try
             {
+                // Wait for call to be answered before first broadcast
+                // (mod_audio_stream connects during ringing, but uuid_broadcast needs answered channel)
+                if (!_callAnsweredTcs.Task.IsCompleted)
+                {
+                    _logger.LogInformation("[FS-{CallId}] Waiting for call answer before playback...", _callConnectionId);
+                    await Task.WhenAny(_callAnsweredTcs.Task, Task.Delay(30000, _cts.Token));
+                }
+
                 while (_playbackQueue.TryDequeue(out var item))
                 {
+                    _isPlayingBack = true;
                     await EslBroadcastAsync(item.filePath);
-                    // Wait for approximate playback duration before playing next
-                    // PCM 16kHz mono 16-bit = 32000 bytes/sec
-                    var durationMs = (int)((double)item.pcmBytes / 32000 * 1000);
+                    // PCM 16kHz mono 16-bit = 32000 bytes/sec + 200ms safety margin
+                    var durationMs = (int)((double)item.pcmBytes / 32000 * 1000) + 200;
+                    _logger.LogInformation("[FS-{CallId}] Playback started, muting upstream for {Duration}ms",
+                        _callConnectionId, durationMs);
                     await Task.Delay(durationMs, _cts.Token);
                 }
+                _isPlayingBack = false;
+                _logger.LogInformation("[FS-{CallId}] Playback queue empty, upstream unmuted", _callConnectionId);
             }
             catch (OperationCanceledException) { }
             finally
             {
+                _isPlayingBack = false;
                 Interlocked.Exchange(ref _playbackRunning, 0);
                 // Re-check in case items were enqueued while we were finishing
                 if (!_playbackQueue.IsEmpty && Interlocked.CompareExchange(ref _playbackRunning, 1, 0) == 0)
@@ -373,9 +402,15 @@ namespace ContactCenterPOC.Models
 
                             if (messageCount <= 3 || messageCount % 100 == 0)
                             {
-                                _logger.LogInformation("[FS-{CallId}] Audio message #{Count} ({Bytes} bytes)",
-                                    _callConnectionId, messageCount, audioData.Length);
+                                _logger.LogInformation("[FS-{CallId}] Audio message #{Count} ({Bytes} bytes){Muted}",
+                                    _callConnectionId, messageCount, audioData.Length,
+                                    _isPlayingBack ? " [muted-echo]" : "");
                             }
+
+                            // During AI playback, skip forwarding mic audio to OpenAI to prevent echo.
+                            // mod_audio_stream captures uuid_broadcast audio mixed into READ stream;
+                            // feeding it to OpenAI triggers false VAD → model self-interrupts → truncated audio.
+                            if (_isPlayingBack) continue;
 
                             // Resample 16kHz → 24kHz for OpenAI
                             var resampled = AudioResampler.Upsample16kTo24k(audioData);

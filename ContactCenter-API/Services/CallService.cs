@@ -61,6 +61,12 @@ namespace ContactCenterPOC.Services
         {
             try
             {
+                // Always notify media handler to unblock playback (idempotent via TrySetResult)
+                if (_mediaHandlers.TryGetValue(uuid, out var handler))
+                {
+                    handler.NotifyCallAnswered();
+                }
+
                 if (!_activeCalls.TryGetValue(uuid, out var activeCall)) return;
 
                 // Guard: skip if already connected (StartCallInteraction also sets Connected)
@@ -325,16 +331,19 @@ namespace ContactCenterPOC.Services
                 }
             }
 
-            // Push status update
-            activeCall.Status = CallStatus.Connected;
-            await _hubContext.Clients.All.SendAsync("CallStatusChanged", new
+            // Push status update (Ringing until ESL ChannelAnswer confirms actual answer)
+            if (activeCall.Status != CallStatus.Connected)
             {
-                callConnectionId = callConnectionId,
-                status = "Connected",
-                phoneNumber = activeCall.TargetPhoneNumber,
-                contactName = activeCall.ContactName,
-                campaignTitle = activeCall.CampaignTitle
-            });
+                activeCall.Status = CallStatus.Ringing;
+                await _hubContext.Clients.All.SendAsync("CallStatusChanged", new
+                {
+                    callConnectionId = callConnectionId,
+                    status = "Ringing",
+                    phoneNumber = activeCall.TargetPhoneNumber,
+                    contactName = activeCall.ContactName,
+                    campaignTitle = activeCall.CampaignTitle
+                });
+            }
 
             var handler = new FreeSwitchMediaHandler(
                 ws, _configuration, _logger, _hubContext,
@@ -343,6 +352,12 @@ namespace ContactCenterPOC.Services
                 voiceApiMode, voiceLiveModel, voiceLiveVoice, _voiceLiveConfig,
                 _freeSwitchService);
             _mediaHandlers[callConnectionId] = handler;
+
+            // If call was already answered (fast answer or inbound), enable playback immediately
+            if (activeCall.Status == CallStatus.Connected)
+            {
+                handler.NotifyCallAnswered();
+            }
 
             try
             {
