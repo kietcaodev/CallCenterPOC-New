@@ -45,14 +45,12 @@ namespace ContactCenterPOC.Models
         private readonly ConcurrentQueue<(string filePath, int pcmBytes)> _playbackQueue = new();
         private int _playbackRunning; // 0 = idle, 1 = running
 
-        // Gate playback until call is actually answered (mod_audio_stream connects during ringing)
-        private readonly TaskCompletionSource<bool> _callAnsweredTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
-
         // True while uuid_broadcast is playing — mutes upstream audio to prevent echo
         private volatile bool _isPlayingBack;
 
-        // Timestamp when current playback started — used to ignore stale VAD events
-        private DateTime _playbackStartedAt = DateTime.MinValue;
+        // Timestamp of last FlushAudioAsync — used to ignore stale VAD events
+        // (OpenAI delivers SpeechStarted AFTER ResponseFinished for already-processed speech)
+        private DateTime _lastFlushAt = DateTime.MinValue;
 
         // Cancel current playback delay on barge-in (so queue processor doesn't block)
         private CancellationTokenSource? _playbackDelayCts;
@@ -90,15 +88,6 @@ namespace ContactCenterPOC.Models
             _selectedVoiceLiveVoice = selectedVoiceLiveVoice;
             _voiceLiveConfig = voiceLiveConfig;
             _freeSwitchService = freeSwitchService;
-        }
-
-        /// <summary>
-        /// Signal that the call has been answered. Unblocks audio playback.
-        /// </summary>
-        public void NotifyCallAnswered()
-        {
-            _logger.LogInformation("[FS-{CallId}] Call answered — playback enabled", _callConnectionId);
-            _callAnsweredTcs.TrySetResult(true);
         }
 
         /// <summary>
@@ -169,15 +158,16 @@ namespace ContactCenterPOC.Models
                 // Handle barge-in: stop current playback when user starts speaking
                 if (IsStopAudioMessage(acsJsonMessage))
                 {
-                    // Ignore stale VAD events that arrive right after playback starts.
-                    // These come from speech the model already processed in its response.
-                    // OpenAI's server VAD detects speech → model generates response → ResponseFinished
-                    // → we start broadcast → then SpeechStarted event arrives (stale, <500ms after broadcast).
-                    var msSincePlaybackStart = (DateTime.UtcNow - _playbackStartedAt).TotalMilliseconds;
-                    if (_isPlayingBack && msSincePlaybackStart < 500)
+                    // Ignore stale VAD events that arrive right after flush.
+                    // OpenAI delivers SpeechStarted AFTER ResponseFinished for speech
+                    // the model already processed. FlushAudioAsync enqueues audio, then
+                    // StopAudio arrives 0-2ms later and clears the queue before
+                    // ProcessPlaybackQueueAsync can even dequeue it.
+                    var msSinceFlush = (DateTime.UtcNow - _lastFlushAt).TotalMilliseconds;
+                    if (msSinceFlush < 600)
                     {
-                        _logger.LogInformation("[FS-{CallId}] Ignoring stale barge-in ({Elapsed}ms after playback start)",
-                            _callConnectionId, (int)msSincePlaybackStart);
+                        _logger.LogInformation("[FS-{CallId}] Ignoring stale barge-in ({Elapsed}ms after flush)",
+                            _callConnectionId, (int)msSinceFlush);
                         return;
                     }
 
@@ -235,6 +225,7 @@ namespace ContactCenterPOC.Models
                     _callConnectionId, _turnCounter, pcmData.Length, filePath);
 
                 // Enqueue for sequential playback
+                _lastFlushAt = DateTime.UtcNow;
                 _playbackQueue.Enqueue((filePath, pcmData.Length));
                 if (Interlocked.CompareExchange(ref _playbackRunning, 1, 0) == 0)
                 {
@@ -256,25 +247,9 @@ namespace ContactCenterPOC.Models
         {
             try
             {
-                // Wait for call to be answered before first broadcast
-                // (mod_audio_stream connects during early media, but uuid_broadcast needs answered channel)
-                if (!_callAnsweredTcs.Task.IsCompleted)
-                {
-                    _logger.LogInformation("[FS-{CallId}] Waiting for call answer before playback...", _callConnectionId);
-                    var timeout = Task.Delay(10000, _cts.Token);
-                    await Task.WhenAny(_callAnsweredTcs.Task, timeout);
-                    if (!_callAnsweredTcs.Task.IsCompleted)
-                    {
-                        // Timeout: audio is flowing so call must be answered; prevent future waits
-                        _logger.LogWarning("[FS-{CallId}] No call-answer signal after 10s, enabling playback anyway", _callConnectionId);
-                        _callAnsweredTcs.TrySetResult(true);
-                    }
-                }
-
                 while (_playbackQueue.TryDequeue(out var item))
                 {
                     _isPlayingBack = true;
-                    _playbackStartedAt = DateTime.UtcNow;
                     await EslBroadcastAsync(item.filePath);
                     // PCM 16kHz mono 16-bit = 32000 bytes/sec + 200ms safety margin
                     var durationMs = (int)((double)item.pcmBytes / 32000 * 1000) + 200;
