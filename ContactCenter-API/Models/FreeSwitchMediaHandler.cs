@@ -51,6 +51,12 @@ namespace ContactCenterPOC.Models
         // True while uuid_broadcast is playing — mutes upstream audio to prevent echo
         private volatile bool _isPlayingBack;
 
+        // Timestamp when current playback started — used to ignore stale VAD events
+        private DateTime _playbackStartedAt = DateTime.MinValue;
+
+        // Cancel current playback delay on barge-in (so queue processor doesn't block)
+        private CancellationTokenSource? _playbackDelayCts;
+
         public FreeSwitchMediaHandler(
             WebSocket webSocket,
             IConfiguration configuration,
@@ -163,14 +169,29 @@ namespace ContactCenterPOC.Models
                 // Handle barge-in: stop current playback when user starts speaking
                 if (IsStopAudioMessage(acsJsonMessage))
                 {
-                    _isPlayingBack = false; // Resume upstream audio to OpenAI
+                    // Ignore stale VAD events that arrive right after playback starts.
+                    // These come from speech the model already processed in its response.
+                    // OpenAI's server VAD detects speech → model generates response → ResponseFinished
+                    // → we start broadcast → then SpeechStarted event arrives (stale, <500ms after broadcast).
+                    var msSincePlaybackStart = (DateTime.UtcNow - _playbackStartedAt).TotalMilliseconds;
+                    if (_isPlayingBack && msSincePlaybackStart < 500)
+                    {
+                        _logger.LogInformation("[FS-{CallId}] Ignoring stale barge-in ({Elapsed}ms after playback start)",
+                            _callConnectionId, (int)msSincePlaybackStart);
+                        return;
+                    }
+
+                    _isPlayingBack = false;
                     _audioBuffer.SetLength(0);
                     // Clear any queued turns and stop current playback
                     while (_playbackQueue.TryDequeue(out _)) { }
+                    // Cancel the playback delay so queue processor doesn't block
+                    _playbackDelayCts?.Cancel();
                     if (_freeSwitchService != null)
                     {
                         await _freeSwitchService.BreakAudioAsync(_callConnectionId);
                     }
+                    _logger.LogInformation("[FS-{CallId}] Barge-in: stopped playback and cleared queue", _callConnectionId);
                     return;
                 }
 
@@ -246,12 +267,20 @@ namespace ContactCenterPOC.Models
                 while (_playbackQueue.TryDequeue(out var item))
                 {
                     _isPlayingBack = true;
+                    _playbackStartedAt = DateTime.UtcNow;
                     await EslBroadcastAsync(item.filePath);
                     // PCM 16kHz mono 16-bit = 32000 bytes/sec + 200ms safety margin
                     var durationMs = (int)((double)item.pcmBytes / 32000 * 1000) + 200;
                     _logger.LogInformation("[FS-{CallId}] Playback started, muting upstream for {Duration}ms",
                         _callConnectionId, durationMs);
-                    await Task.Delay(durationMs, _cts.Token);
+                    // Use linked CTS so barge-in can cancel delay immediately
+                    _playbackDelayCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+                    try { await Task.Delay(durationMs, _playbackDelayCts.Token); }
+                    catch (OperationCanceledException) when (!_cts.IsCancellationRequested)
+                    {
+                        _logger.LogInformation("[FS-{CallId}] Playback delay cancelled by barge-in", _callConnectionId);
+                    }
+                    finally { _playbackDelayCts.Dispose(); _playbackDelayCts = null; }
                 }
                 _isPlayingBack = false;
                 _logger.LogInformation("[FS-{CallId}] Playback queue empty, upstream unmuted", _callConnectionId);
@@ -399,13 +428,6 @@ namespace ContactCenterPOC.Models
                             messageCount++;
                             var audioData = messageBuffer.ToArray();
                             messageBuffer.SetLength(0);
-
-                            if (messageCount <= 3 || messageCount % 100 == 0)
-                            {
-                                _logger.LogInformation("[FS-{CallId}] Audio message #{Count} ({Bytes} bytes){Muted}",
-                                    _callConnectionId, messageCount, audioData.Length,
-                                    _isPlayingBack ? " [muted-echo]" : "");
-                            }
 
                             // During AI playback, skip forwarding mic audio to OpenAI to prevent echo.
                             // mod_audio_stream captures uuid_broadcast audio mixed into READ stream;
