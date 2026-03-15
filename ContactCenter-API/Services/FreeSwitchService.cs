@@ -1,5 +1,6 @@
 using NEventSocket;
 using NEventSocket.FreeSwitch;
+using System.Collections.Concurrent;
 using System.Reactive.Linq;
 
 namespace ContactCenterPOC.Services
@@ -25,6 +26,9 @@ namespace ContactCenterPOC.Services
         public event Action<string, string>? CallHangup;  // uuid, cause
         public event Action<string>? CallFailed;          // uuid
 
+        // Per-UUID playback completion waiters (set by CHANNEL_EXECUTE_COMPLETE for playback)
+        private readonly ConcurrentDictionary<string, TaskCompletionSource<bool>> _playbackWaiters = new();
+
         public FreeSwitchService(IConfiguration configuration, ILogger<FreeSwitchService> logger)
         {
             _configuration = configuration;
@@ -46,7 +50,8 @@ namespace ContactCenterPOC.Services
                 await _eventConn.SubscribeEvents(
                     EventName.ChannelAnswer,
                     EventName.ChannelHangupComplete,
-                    EventName.ChannelState);
+                    EventName.ChannelState,
+                    EventName.PlaybackStop);
 
                 SetupEventHandlers();
                 _logger.LogInformation("FreeSWITCH event connection established");
@@ -82,6 +87,9 @@ namespace ContactCenterPOC.Services
                     if (!string.IsNullOrEmpty(uuid))
                     {
                         _logger.LogInformation("FreeSWITCH call hangup: {UUID}, cause: {Cause}", uuid, cause);
+                        // Clean up any pending playback waiter
+                        if (_playbackWaiters.TryRemove(uuid, out var tcs))
+                            tcs.TrySetCanceled();
                         if (cause == "ORIGINATOR_CANCEL" || cause == "NO_ANSWER" || cause == "USER_BUSY" ||
                             cause == "NO_ROUTE_DESTINATION" || cause == "CALL_REJECTED")
                         {
@@ -91,6 +99,19 @@ namespace ContactCenterPOC.Services
                         {
                             CallHangup?.Invoke(uuid, cause);
                         }
+                    }
+                });
+
+            _eventConn.Events.Where(x => x.EventName == EventName.PlaybackStop)
+                .Subscribe(evt =>
+                {
+                    var uuid = evt.Headers.ContainsKey("Unique-ID") ? evt.Headers["Unique-ID"] : "";
+                    if (!string.IsNullOrEmpty(uuid))
+                    {
+                        var filePath = evt.Headers.ContainsKey("Playback-File-Path") ? evt.Headers["Playback-File-Path"] : "";
+                        _logger.LogInformation("FreeSWITCH PLAYBACK_STOP: {UUID}, file={File}", uuid, filePath);
+                        if (_playbackWaiters.TryRemove(uuid, out var tcs))
+                            tcs.TrySetResult(true);
                     }
                 });
         }
@@ -239,6 +260,9 @@ namespace ContactCenterPOC.Services
             if (_commandConn == null) return;
             try
             {
+                // Cancel any pending playback waiter so the queue processor unblocks immediately
+                if (_playbackWaiters.TryRemove(uuid, out var tcs))
+                    tcs.TrySetCanceled();
                 var result = await _commandConn.SendApi($"uuid_break {uuid} all");
                 _logger.LogInformation("BreakAudio {UUID}: {Result}", uuid, result.BodyText?.Trim());
             }
@@ -246,6 +270,32 @@ namespace ContactCenterPOC.Services
             {
                 _logger.LogWarning(ex, "BreakAudio failed for {UUID}", uuid);
             }
+        }
+
+        /// <summary>
+        /// Wait for the current playback to finish on the given UUID.
+        /// Returns when PLAYBACK_STOP fires, or after the fallback timeout.
+        /// </summary>
+        public async Task WaitForPlaybackStopAsync(string uuid, int fallbackMs, CancellationToken ct)
+        {
+            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _playbackWaiters[uuid] = tcs;
+            using var reg = ct.Register(() =>
+            {
+                if (_playbackWaiters.TryRemove(uuid, out var w))
+                    w.TrySetCanceled();
+            });
+            try
+            {
+                // Fallback: if PLAYBACK_STOP never arrives, don't block forever
+                var winner = await Task.WhenAny(tcs.Task, Task.Delay(fallbackMs, ct));
+                if (winner != tcs.Task)
+                {
+                    _logger.LogWarning("WaitForPlaybackStop {UUID}: fallback timeout {Ms}ms elapsed", uuid, fallbackMs);
+                    _playbackWaiters.TryRemove(uuid, out _);
+                }
+            }
+            catch (OperationCanceledException) { }
         }
 
         /// <summary>

@@ -37,6 +37,10 @@ namespace ContactCenterPOC.Models
         private const int FreeSwitchSampleRate = 16000;
         private const int OpenAiSampleRate = 24000;
 
+        // Auto-flush threshold: flush buffer during generation every ~4 seconds of audio
+        // to avoid waiting for entire response before playback (PCM 16kHz mono 16-bit = 32000 bytes/sec)
+        private const int AutoFlushThresholdBytes = 128000;
+
         // Buffer to accumulate audio chunks per AI turn, then play via ESL
         private readonly MemoryStream _audioBuffer = new();
         private int _turnCounter;
@@ -51,9 +55,6 @@ namespace ContactCenterPOC.Models
         // Timestamp of last FlushAudioAsync — used to ignore stale VAD events
         // (OpenAI delivers SpeechStarted AFTER ResponseFinished for already-processed speech)
         private DateTime _lastFlushAt = DateTime.MinValue;
-
-        // Cancel current playback delay on barge-in (so queue processor doesn't block)
-        private CancellationTokenSource? _playbackDelayCts;
 
         public FreeSwitchMediaHandler(
             WebSocket webSocket,
@@ -175,8 +176,7 @@ namespace ContactCenterPOC.Models
                     _audioBuffer.SetLength(0);
                     // Clear any queued turns and stop current playback
                     while (_playbackQueue.TryDequeue(out _)) { }
-                    // Cancel the playback delay so queue processor doesn't block
-                    _playbackDelayCts?.Cancel();
+                    // BreakAudioAsync also cancels the pending WaitForPlaybackStopAsync waiter
                     if (_freeSwitchService != null)
                     {
                         await _freeSwitchService.BreakAudioAsync(_callConnectionId);
@@ -191,6 +191,14 @@ namespace ContactCenterPOC.Models
                     // Resample 24kHz → 16kHz for FreeSWITCH
                     var resampled = AudioResampler.Downsample24kTo16k(audioBytes);
                     _audioBuffer.Write(resampled, 0, resampled.Length);
+
+                    // Auto-flush when buffer exceeds threshold for low-latency playback.
+                    // Without this, long AI responses are fully buffered before any audio plays,
+                    // causing 30+ seconds of silence until ResponseFinished.
+                    if (_audioBuffer.Length >= AutoFlushThresholdBytes)
+                    {
+                        await FlushAudioAsync();
+                    }
                 }
             }
             catch (Exception ex)
@@ -239,7 +247,7 @@ namespace ContactCenterPOC.Models
         }
 
         /// <summary>
-        /// Process queued audio files sequentially: play one, wait for its duration, then play next.
+        /// Process queued audio files sequentially: play one, wait for PLAYBACK_STOP event, then play next.
         /// Mutes upstream mic audio during playback to prevent echo from mod_audio_stream
         /// feeding uuid_broadcast audio back to OpenAI (which would trigger false VAD → incomplete responses).
         /// </summary>
@@ -251,18 +259,22 @@ namespace ContactCenterPOC.Models
                 {
                     _isPlayingBack = true;
                     await EslBroadcastAsync(item.filePath);
-                    // PCM 16kHz mono 16-bit = 32000 bytes/sec + 200ms safety margin
-                    var durationMs = (int)((double)item.pcmBytes / 32000 * 1000) + 200;
-                    _logger.LogInformation("[FS-{CallId}] Playback started, muting upstream for {Duration}ms",
-                        _callConnectionId, durationMs);
-                    // Use linked CTS so barge-in can cancel delay immediately
-                    _playbackDelayCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
-                    try { await Task.Delay(durationMs, _playbackDelayCts.Token); }
-                    catch (OperationCanceledException) when (!_cts.IsCancellationRequested)
+                    // Wait for FreeSWITCH PLAYBACK_STOP event instead of estimating duration.
+                    // Fallback timeout = estimated duration + 2s safety margin in case event is lost.
+                    var fallbackMs = (int)((double)item.pcmBytes / 32000 * 1000) + 2000;
+                    _logger.LogInformation("[FS-{CallId}] Waiting for PLAYBACK_STOP (fallback {Fallback}ms)",
+                        _callConnectionId, fallbackMs);
+                    if (_freeSwitchService != null)
                     {
-                        _logger.LogInformation("[FS-{CallId}] Playback delay cancelled by barge-in", _callConnectionId);
+                        try
+                        {
+                            await _freeSwitchService.WaitForPlaybackStopAsync(_callConnectionId, fallbackMs, _cts.Token);
+                        }
+                        catch (OperationCanceledException) when (!_cts.IsCancellationRequested)
+                        {
+                            _logger.LogInformation("[FS-{CallId}] Playback wait cancelled by barge-in", _callConnectionId);
+                        }
                     }
-                    finally { _playbackDelayCts.Dispose(); _playbackDelayCts = null; }
                 }
                 _isPlayingBack = false;
                 _logger.LogInformation("[FS-{CallId}] Playback queue empty, upstream unmuted", _callConnectionId);
