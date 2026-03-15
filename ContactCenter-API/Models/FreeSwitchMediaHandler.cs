@@ -37,9 +37,9 @@ namespace ContactCenterPOC.Models
         private const int FreeSwitchSampleRate = 16000;
         private const int OpenAiSampleRate = 24000;
 
-        // Buffer to accumulate audio chunks per AI turn, then play via ESL
-        private readonly MemoryStream _audioBuffer = new();
-        private int _turnCounter;
+        // Lock for thread-safe WebSocket sending (ReceiveAsync and SendAsync can run concurrently,
+        // but multiple SendAsync calls must not overlap)
+        private readonly SemaphoreSlim _wsSendLock = new(1, 1);
 
         public FreeSwitchMediaHandler(
             WebSocket webSocket,
@@ -135,8 +135,8 @@ namespace ContactCenterPOC.Models
         }
 
         /// <summary>
-        /// Buffer resampled audio from AI for later playback via ESL uuid_broadcast.
-        /// Called by AI services per audio chunk. Audio is accumulated until FlushAudioAsync.
+        /// Stream resampled audio directly to FreeSWITCH via WebSocket binary frame.
+        /// mod_audio_stream plays incoming binary frames to the caller in real-time.
         /// </summary>
         public async Task SendMessageAsync(string acsJsonMessage)
         {
@@ -147,98 +147,40 @@ namespace ContactCenterPOC.Models
                 {
                     // Resample 24kHz → 16kHz for FreeSWITCH
                     var resampled = AudioResampler.Downsample24kTo16k(audioBytes);
-                    _audioBuffer.Write(resampled, 0, resampled.Length);
+
+                    // Send directly through WebSocket — mod_audio_stream plays it to the caller
+                    if (_webSocket?.State == WebSocketState.Open)
+                    {
+                        await _wsSendLock.WaitAsync(_cts.Token);
+                        try
+                        {
+                            await _webSocket.SendAsync(
+                                new ArraySegment<byte>(resampled),
+                                WebSocketMessageType.Binary,
+                                true,
+                                _cts.Token);
+                        }
+                        finally
+                        {
+                            _wsSendLock.Release();
+                        }
+                    }
                 }
             }
+            catch (OperationCanceledException) { }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "[FS-{CallId}] Failed to buffer audio", _callConnectionId);
-            }
-            await Task.CompletedTask;
-        }
-
-        /// <summary>
-        /// Write buffered audio to a WAV file and play it back to the caller via ESL uuid_broadcast.
-        /// Called when AI finishes generating one turn of audio.
-        /// </summary>
-        public async Task FlushAudioAsync()
-        {
-            if (_audioBuffer.Length == 0) return;
-
-            var pcmData = _audioBuffer.ToArray();
-            _audioBuffer.SetLength(0);
-            _turnCounter++;
-
-            // Write WAV file to /tmp/
-            var fileName = $"ai_{_callConnectionId}_{_turnCounter}.wav";
-            var filePath = Path.Combine(Path.GetTempPath(), fileName);
-
-            try
-            {
-                await using (var fs = new FileStream(filePath, FileMode.Create, FileAccess.Write))
-                {
-                    WriteWavHeader(fs, pcmData.Length, 16000, 1, 16);
-                    await fs.WriteAsync(pcmData);
-                }
-
-                _logger.LogInformation("[FS-{CallId}] Wrote audio turn #{Turn} ({Bytes} bytes) to {Path}",
-                    _callConnectionId, _turnCounter, pcmData.Length, filePath);
-
-                // Play via ESL uuid_broadcast
-                await EslBroadcastAsync(filePath);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "[FS-{CallId}] Failed to flush audio turn #{Turn}", _callConnectionId, _turnCounter);
+                _logger.LogError(ex, "[FS-{CallId}] Failed to send audio via WebSocket", _callConnectionId);
             }
         }
 
         /// <summary>
-        /// Play audio file on the call via FreeSwitchService ESL connection.
+        /// No-op: audio is now streamed directly via WebSocket in SendMessageAsync.
+        /// Kept for IMediaStreamingHandler interface compatibility.
         /// </summary>
-        private async Task EslBroadcastAsync(string filePath)
+        public Task FlushAudioAsync()
         {
-            if (_freeSwitchService == null)
-            {
-                _logger.LogError("[FS-{CallId}] FreeSwitchService is NULL — was not injected", _callConnectionId);
-                return;
-            }
-
-            _logger.LogInformation("[FS-{CallId}] ESL IsConnected={Connected}, calling PlayAudioAsync for {Path}",
-                _callConnectionId, _freeSwitchService.IsConnected, filePath);
-
-            try
-            {
-                var result = await _freeSwitchService.PlayAudioAsync(_callConnectionId, filePath);
-                _logger.LogInformation("[FS-{CallId}] ESL uuid_broadcast result: {Result}", _callConnectionId, result);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "[FS-{CallId}] ESL uuid_broadcast failed", _callConnectionId);
-            }
-        }
-
-        /// <summary>
-        /// Write a standard PCM WAV header.
-        /// </summary>
-        private static void WriteWavHeader(Stream stream, int dataLength, int sampleRate, int channels, int bitsPerSample)
-        {
-            var byteRate = sampleRate * channels * bitsPerSample / 8;
-            var blockAlign = (short)(channels * bitsPerSample / 8);
-            using var bw = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
-            bw.Write(Encoding.ASCII.GetBytes("RIFF"));
-            bw.Write(36 + dataLength); // file size - 8
-            bw.Write(Encoding.ASCII.GetBytes("WAVE"));
-            bw.Write(Encoding.ASCII.GetBytes("fmt "));
-            bw.Write(16); // PCM chunk size
-            bw.Write((short)1); // PCM format
-            bw.Write((short)channels);
-            bw.Write(sampleRate);
-            bw.Write(byteRate);
-            bw.Write(blockAlign);
-            bw.Write((short)bitsPerSample);
-            bw.Write(Encoding.ASCII.GetBytes("data"));
-            bw.Write(dataLength);
+            return Task.CompletedTask;
         }
 
         /// <summary>

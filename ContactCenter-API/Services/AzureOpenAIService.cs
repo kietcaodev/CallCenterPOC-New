@@ -158,7 +158,23 @@ namespace ContactCenterPOC.Services
             };
 
             await session.ConfigureSessionAsync(sessionOptions);
-            _logger.LogInformation("[AI-{CallId}] Session configured (voice={Voice}, format=PCM16, VAD enabled)", _callConnectionId, _selectedVoice);
+
+            // Set Whisper language to Vietnamese via raw session.update
+            // (Language property not available in this SDK version)
+            var langUpdate = BinaryData.FromString("""
+                {
+                    "type": "session.update",
+                    "session": {
+                        "input_audio_transcription": {
+                            "model": "whisper-1",
+                            "language": "vi"
+                        }
+                    }
+                }
+                """);
+            await session.SendCommandAsync(langUpdate, null);
+
+            _logger.LogInformation("[AI-{CallId}] Session configured (voice={Voice}, format=PCM16, VAD enabled, lang=vi)", _callConnectionId, _selectedVoice);
             return session;
         }
 
