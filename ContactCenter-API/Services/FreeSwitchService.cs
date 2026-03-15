@@ -229,6 +229,23 @@ namespace ContactCenterPOC.Services
             return body;
         }
 
+        /// <summary>
+        /// Stop any current audio playback on the call (barge-in support).
+        /// </summary>
+        public async Task BreakAudioAsync(string uuid)
+        {
+            if (_commandConn == null) return;
+            try
+            {
+                var result = await _commandConn.SendApi($"uuid_break {uuid} all");
+                _logger.LogInformation("BreakAudio {UUID}: {Result}", uuid, result.BodyText?.Trim());
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "BreakAudio failed for {UUID}", uuid);
+            }
+        }
+
         public bool IsConnected => _commandConn != null;
 
         private async Task TryReconnectAsync()

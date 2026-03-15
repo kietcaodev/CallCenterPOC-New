@@ -37,9 +37,13 @@ namespace ContactCenterPOC.Models
         private const int FreeSwitchSampleRate = 16000;
         private const int OpenAiSampleRate = 24000;
 
-        // Lock for thread-safe WebSocket sending (ReceiveAsync and SendAsync can run concurrently,
-        // but multiple SendAsync calls must not overlap)
-        private readonly SemaphoreSlim _wsSendLock = new(1, 1);
+        // Buffer to accumulate audio chunks per AI turn, then play via ESL
+        private readonly MemoryStream _audioBuffer = new();
+        private int _turnCounter;
+
+        // Playback queue: ensures turns play sequentially without overlapping
+        private readonly ConcurrentQueue<(string filePath, int pcmBytes)> _playbackQueue = new();
+        private int _playbackRunning; // 0 = idle, 1 = running
 
         public FreeSwitchMediaHandler(
             WebSocket webSocket,
@@ -135,52 +139,155 @@ namespace ContactCenterPOC.Models
         }
 
         /// <summary>
-        /// Stream resampled audio directly to FreeSWITCH via WebSocket binary frame.
-        /// mod_audio_stream plays incoming binary frames to the caller in real-time.
+        /// Buffer resampled audio from AI, or handle StopAudio (barge-in).
         /// </summary>
         public async Task SendMessageAsync(string acsJsonMessage)
         {
             try
             {
+                // Handle barge-in: stop current playback when user starts speaking
+                if (IsStopAudioMessage(acsJsonMessage))
+                {
+                    _audioBuffer.SetLength(0);
+                    // Clear any queued turns and stop current playback
+                    while (_playbackQueue.TryDequeue(out _)) { }
+                    if (_freeSwitchService != null)
+                    {
+                        await _freeSwitchService.BreakAudioAsync(_callConnectionId);
+                    }
+                    return;
+                }
+
                 var audioBytes = ExtractAudioFromAcsJson(acsJsonMessage);
                 if (audioBytes != null && audioBytes.Length > 0)
                 {
                     // Resample 24kHz → 16kHz for FreeSWITCH
                     var resampled = AudioResampler.Downsample24kTo16k(audioBytes);
-
-                    // Send directly through WebSocket — mod_audio_stream plays it to the caller
-                    if (_webSocket?.State == WebSocketState.Open)
-                    {
-                        await _wsSendLock.WaitAsync(_cts.Token);
-                        try
-                        {
-                            await _webSocket.SendAsync(
-                                new ArraySegment<byte>(resampled),
-                                WebSocketMessageType.Binary,
-                                true,
-                                _cts.Token);
-                        }
-                        finally
-                        {
-                            _wsSendLock.Release();
-                        }
-                    }
+                    _audioBuffer.Write(resampled, 0, resampled.Length);
                 }
             }
-            catch (OperationCanceledException) { }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "[FS-{CallId}] Failed to send audio via WebSocket", _callConnectionId);
+                _logger.LogError(ex, "[FS-{CallId}] Failed to buffer audio", _callConnectionId);
             }
         }
 
         /// <summary>
-        /// No-op: audio is now streamed directly via WebSocket in SendMessageAsync.
-        /// Kept for IMediaStreamingHandler interface compatibility.
+        /// Write buffered audio to a WAV file and enqueue for sequential playback via ESL.
         /// </summary>
-        public Task FlushAudioAsync()
+        public async Task FlushAudioAsync()
         {
-            return Task.CompletedTask;
+            if (_audioBuffer.Length == 0) return;
+
+            var pcmData = _audioBuffer.ToArray();
+            _audioBuffer.SetLength(0);
+            _turnCounter++;
+
+            var fileName = $"ai_{_callConnectionId}_{_turnCounter}.wav";
+            var filePath = Path.Combine(Path.GetTempPath(), fileName);
+
+            try
+            {
+                await using (var fs = new FileStream(filePath, FileMode.Create, FileAccess.Write))
+                {
+                    WriteWavHeader(fs, pcmData.Length, 16000, 1, 16);
+                    await fs.WriteAsync(pcmData);
+                }
+
+                _logger.LogInformation("[FS-{CallId}] Wrote audio turn #{Turn} ({Bytes} bytes) to {Path}",
+                    _callConnectionId, _turnCounter, pcmData.Length, filePath);
+
+                // Enqueue for sequential playback
+                _playbackQueue.Enqueue((filePath, pcmData.Length));
+                if (Interlocked.CompareExchange(ref _playbackRunning, 1, 0) == 0)
+                {
+                    _ = Task.Run(ProcessPlaybackQueueAsync);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[FS-{CallId}] Failed to flush audio turn #{Turn}", _callConnectionId, _turnCounter);
+            }
+        }
+
+        /// <summary>
+        /// Process queued audio files sequentially: play one, wait for its duration, then play next.
+        /// </summary>
+        private async Task ProcessPlaybackQueueAsync()
+        {
+            try
+            {
+                while (_playbackQueue.TryDequeue(out var item))
+                {
+                    await EslBroadcastAsync(item.filePath);
+                    // Wait for approximate playback duration before playing next
+                    // PCM 16kHz mono 16-bit = 32000 bytes/sec
+                    var durationMs = (int)((double)item.pcmBytes / 32000 * 1000);
+                    await Task.Delay(durationMs, _cts.Token);
+                }
+            }
+            catch (OperationCanceledException) { }
+            finally
+            {
+                Interlocked.Exchange(ref _playbackRunning, 0);
+                // Re-check in case items were enqueued while we were finishing
+                if (!_playbackQueue.IsEmpty && Interlocked.CompareExchange(ref _playbackRunning, 1, 0) == 0)
+                {
+                    _ = Task.Run(ProcessPlaybackQueueAsync);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Play audio file on the call via FreeSwitchService ESL connection.
+        /// </summary>
+        private async Task EslBroadcastAsync(string filePath)
+        {
+            if (_freeSwitchService == null) return;
+
+            _logger.LogInformation("[FS-{CallId}] ESL IsConnected={Connected}, calling PlayAudioAsync for {Path}",
+                _callConnectionId, _freeSwitchService.IsConnected, filePath);
+
+            try
+            {
+                var result = await _freeSwitchService.PlayAudioAsync(_callConnectionId, filePath);
+                _logger.LogInformation("[FS-{CallId}] ESL uuid_broadcast result: {Result}", _callConnectionId, result);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[FS-{CallId}] ESL uuid_broadcast failed", _callConnectionId);
+            }
+        }
+
+        private static void WriteWavHeader(Stream stream, int dataLength, int sampleRate, int channels, int bitsPerSample)
+        {
+            var byteRate = sampleRate * channels * bitsPerSample / 8;
+            var blockAlign = (short)(channels * bitsPerSample / 8);
+            using var bw = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
+            bw.Write(Encoding.ASCII.GetBytes("RIFF"));
+            bw.Write(36 + dataLength);
+            bw.Write(Encoding.ASCII.GetBytes("WAVE"));
+            bw.Write(Encoding.ASCII.GetBytes("fmt "));
+            bw.Write(16);
+            bw.Write((short)1);
+            bw.Write((short)channels);
+            bw.Write(sampleRate);
+            bw.Write(byteRate);
+            bw.Write(blockAlign);
+            bw.Write((short)bitsPerSample);
+            bw.Write(Encoding.ASCII.GetBytes("data"));
+            bw.Write(dataLength);
+        }
+
+        private static bool IsStopAudioMessage(string json)
+        {
+            try
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(json);
+                return doc.RootElement.TryGetProperty("kind", out var kind)
+                    && kind.GetString() == "StopAudio";
+            }
+            catch { return false; }
         }
 
         /// <summary>
