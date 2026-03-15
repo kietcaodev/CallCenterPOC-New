@@ -212,6 +212,8 @@ namespace ContactCenterPOC.Models
 
         /// <summary>
         /// Process queued audio files sequentially: play one, wait for its duration, then play next.
+        /// No need to pause/resume stream — uuid_displace mw plays on WRITE only,
+        /// so mod_audio_stream (READ) doesn't capture playback audio.
         /// </summary>
         private async Task ProcessPlaybackQueueAsync()
         {

@@ -204,6 +204,8 @@ namespace ContactCenterPOC.Services
 
         /// <summary>
         /// Send audio file to FreeSWITCH for playback on the call.
+        /// Uses uuid_displace with 'mw' (mix write) to play on WRITE direction only,
+        /// so mod_audio_stream (READ direction) does not capture playback audio (no echo).
         /// Auto-reconnects if ESL connection is down.
         /// </summary>
         public async Task<string> PlayAudioAsync(string uuid, string filePath)
@@ -221,7 +223,7 @@ namespace ContactCenterPOC.Services
                 return "-ERR not connected";
             }
 
-            var cmd = $"uuid_broadcast {uuid} {filePath} aleg";
+            var cmd = $"uuid_displace {uuid} start {filePath} 0 mw";
             _logger.LogInformation("PlayAudioAsync: Sending ESL command: {Cmd}", cmd);
             var result = await _commandConn.SendApi(cmd);
             var body = result.BodyText?.Trim() ?? "(no body)";
@@ -231,18 +233,55 @@ namespace ContactCenterPOC.Services
 
         /// <summary>
         /// Stop any current audio playback on the call (barge-in support).
+        /// Stops uuid_displace playback and also uuid_break for any other playback.
         /// </summary>
         public async Task BreakAudioAsync(string uuid)
         {
             if (_commandConn == null) return;
             try
             {
-                var result = await _commandConn.SendApi($"uuid_break {uuid} all");
-                _logger.LogInformation("BreakAudio {UUID}: {Result}", uuid, result.BodyText?.Trim());
+                // Stop uuid_displace playback
+                var result = await _commandConn.SendApi($"uuid_displace {uuid} stop");
+                _logger.LogInformation("BreakAudio displace stop {UUID}: {Result}", uuid, result.BodyText?.Trim());
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "BreakAudio failed for {UUID}", uuid);
+            }
+        }
+
+        /// <summary>
+        /// Pause mod_audio_stream (stops sending mic audio to WebSocket).
+        /// Used to prevent echo during AI audio playback.
+        /// </summary>
+        public async Task PauseStreamAsync(string uuid)
+        {
+            if (_commandConn == null) return;
+            try
+            {
+                var result = await _commandConn.SendApi($"uuid_audio_stream {uuid} pause");
+                _logger.LogDebug("PauseStream {UUID}: {Result}", uuid, result.BodyText?.Trim());
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "PauseStream failed for {UUID}", uuid);
+            }
+        }
+
+        /// <summary>
+        /// Resume mod_audio_stream (resumes sending mic audio to WebSocket).
+        /// </summary>
+        public async Task ResumeStreamAsync(string uuid)
+        {
+            if (_commandConn == null) return;
+            try
+            {
+                var result = await _commandConn.SendApi($"uuid_audio_stream {uuid} resume");
+                _logger.LogDebug("ResumeStream {UUID}: {Result}", uuid, result.BodyText?.Trim());
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "ResumeStream failed for {UUID}", uuid);
             }
         }
 
