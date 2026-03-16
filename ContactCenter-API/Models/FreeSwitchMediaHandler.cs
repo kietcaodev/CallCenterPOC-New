@@ -38,6 +38,12 @@ namespace ContactCenterPOC.Models
         private const int FreeSwitchSampleRate = 16000;
         private const int OpenAiSampleRate = 24000;
 
+        // Pre-allocated silence frame at 24kHz PCM16 mono (20ms = 960 bytes).
+        // Sent to OpenAI during playback mute to maintain continuous audio stream;
+        // without this, server-side VAD loses context and won't detect speech onset
+        // when real mic audio resumes after the gap.
+        private static readonly byte[] SilenceFrame24k = new byte[960];
+
         // Auto-flush threshold: flush buffer during generation every ~4 seconds of audio
         // to avoid waiting for entire response before playback (PCM 16kHz mono 16-bit = 32000 bytes/sec)
         private const int AutoFlushThresholdBytes = 128000;
@@ -403,6 +409,8 @@ namespace ContactCenterPOC.Models
                 var buffer = new byte[4096];
                 var messageBuffer = new MemoryStream();
                 int messageCount = 0;
+                int forwardedCount = 0;
+                int silenceCount = 0;
 
                 while (_webSocket.State == WebSocketState.Open)
                 {
@@ -425,13 +433,30 @@ namespace ContactCenterPOC.Models
                             var audioData = messageBuffer.ToArray();
                             messageBuffer.SetLength(0);
 
-                            // During AI playback, skip forwarding mic audio to OpenAI to prevent echo.
-                            // mod_audio_stream captures uuid_broadcast audio mixed into READ stream;
-                            // feeding it to OpenAI triggers false VAD → model self-interrupts → truncated audio.
-                            if (_isPlayingBack) continue;
+                            if (_isPlayingBack)
+                            {
+                                // During AI playback, send silence to OpenAI instead of mic audio.
+                                // mod_audio_stream captures uuid_broadcast audio mixed into READ stream;
+                                // sending that would trigger false VAD → model self-interrupts.
+                                // Sending silence (instead of nothing) keeps the audio stream continuous
+                                // so server-side VAD properly detects speech when playback ends.
+                                silenceCount++;
+                                using var silenceMs = new MemoryStream(SilenceFrame24k);
+                                if (_vlServiceHandler != null)
+                                    await _vlServiceHandler.SendAudioToExternalAI(silenceMs);
+                                else if (_aiServiceHandler != null)
+                                    await _aiServiceHandler.SendAudioToExternalAI(silenceMs);
+                                continue;
+                            }
 
                             // Resample 16kHz → 24kHz for OpenAI
                             var resampled = AudioResampler.Upsample16kTo24k(audioData);
+                            forwardedCount++;
+                            if (forwardedCount == 1 || forwardedCount % 250 == 0)
+                            {
+                                _log.Info("Audio stats: forwarded={Forwarded}, silence={Silence}",
+                                    forwardedCount, silenceCount);
+                            }
 
                             using var ms = new MemoryStream(resampled);
                             if (_vlServiceHandler != null)
@@ -453,8 +478,8 @@ namespace ContactCenterPOC.Models
                     }
                 }
 
-                _log.Info("FreeSWITCH receive loop ended. Total messages: {Count}",
-                    messageCount);
+                _log.Info("FreeSWITCH receive loop ended. Total messages: {Count}, forwarded: {Forwarded}, silence: {Silence}",
+                    messageCount, forwardedCount, silenceCount);
             }
             catch (OperationCanceledException)
             {

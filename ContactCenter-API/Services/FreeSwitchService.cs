@@ -51,7 +51,8 @@ namespace ContactCenterPOC.Services
                     EventName.ChannelAnswer,
                     EventName.ChannelHangupComplete,
                     EventName.ChannelState,
-                    EventName.PlaybackStop);
+                    EventName.PlaybackStop,
+                    EventName.ChannelExecuteComplete);
 
                 SetupEventHandlers();
                 _logger.LogInformation("FreeSWITCH event connection established");
@@ -110,6 +111,23 @@ namespace ContactCenterPOC.Services
                     {
                         var filePath = evt.Headers.ContainsKey("Playback-File-Path") ? evt.Headers["Playback-File-Path"] : "";
                         _logger.LogInformation("[{UUID}] PLAYBACK_STOP, file={File}", uuid, filePath);
+                        if (_playbackWaiters.TryRemove(uuid, out var tcs))
+                            tcs.TrySetResult(true);
+                    }
+                });
+
+            // Backup handler: uuid_broadcast may fire CHANNEL_EXECUTE_COMPLETE (Application=playback)
+            // instead of (or in addition to) PLAYBACK_STOP depending on FreeSWITCH version.
+            _eventConn.Events.Where(x => x.EventName == EventName.ChannelExecuteComplete)
+                .Subscribe(evt =>
+                {
+                    var app = evt.Headers.ContainsKey("Application") ? evt.Headers["Application"] : "";
+                    if (app != "playback") return;
+                    var uuid = evt.Headers.ContainsKey("Unique-ID") ? evt.Headers["Unique-ID"] : "";
+                    if (!string.IsNullOrEmpty(uuid))
+                    {
+                        var filePath = evt.Headers.ContainsKey("Application-Data") ? evt.Headers["Application-Data"] : "";
+                        _logger.LogInformation("[{UUID}] EXECUTE_COMPLETE (playback), file={File}", uuid, filePath);
                         if (_playbackWaiters.TryRemove(uuid, out var tcs))
                             tcs.TrySetResult(true);
                     }
