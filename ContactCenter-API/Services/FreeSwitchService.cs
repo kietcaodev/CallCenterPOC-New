@@ -26,8 +26,10 @@ namespace ContactCenterPOC.Services
         public event Action<string, string>? CallHangup;  // uuid, cause
         public event Action<string>? CallFailed;          // uuid
 
-        // Per-UUID playback completion waiters (set by CHANNEL_EXECUTE_COMPLETE for playback)
-        private readonly ConcurrentDictionary<string, TaskCompletionSource<bool>> _playbackWaiters = new();
+        // Per-UUID playback completion waiters — includes expected file path to avoid
+        // race conditions when EXECUTE_COMPLETE for a previous broadcast resolves the
+        // waiter of a subsequent broadcast (both share the same call UUID).
+        private readonly ConcurrentDictionary<string, (TaskCompletionSource<bool> tcs, string filePath)> _playbackWaiters = new();
 
         public FreeSwitchService(IConfiguration configuration, ILogger<FreeSwitchService> logger)
         {
@@ -89,8 +91,8 @@ namespace ContactCenterPOC.Services
                     {
                         _logger.LogInformation("[{UUID}] Call hangup, cause: {Cause}", uuid, cause);
                         // Clean up any pending playback waiter
-                        if (_playbackWaiters.TryRemove(uuid, out var tcs))
-                            tcs.TrySetCanceled();
+                        if (_playbackWaiters.TryRemove(uuid, out var entry))
+                            entry.tcs.TrySetCanceled();
                         if (cause == "ORIGINATOR_CANCEL" || cause == "NO_ANSWER" || cause == "USER_BUSY" ||
                             cause == "NO_ROUTE_DESTINATION" || cause == "CALL_REJECTED")
                         {
@@ -111,8 +113,12 @@ namespace ContactCenterPOC.Services
                     {
                         var filePath = evt.Headers.ContainsKey("Playback-File-Path") ? evt.Headers["Playback-File-Path"] : "";
                         _logger.LogInformation("[{UUID}] PLAYBACK_STOP, file={File}", uuid, filePath);
-                        if (_playbackWaiters.TryRemove(uuid, out var tcs))
-                            tcs.TrySetResult(true);
+                        if (_playbackWaiters.TryGetValue(uuid, out var entry) &&
+                            string.Equals(entry.filePath, filePath, StringComparison.Ordinal))
+                        {
+                            if (_playbackWaiters.TryRemove(uuid, out _))
+                                entry.tcs.TrySetResult(true);
+                        }
                     }
                 });
 
@@ -128,8 +134,12 @@ namespace ContactCenterPOC.Services
                     {
                         var filePath = evt.Headers.ContainsKey("Application-Data") ? evt.Headers["Application-Data"] : "";
                         _logger.LogInformation("[{UUID}] EXECUTE_COMPLETE (playback), file={File}", uuid, filePath);
-                        if (_playbackWaiters.TryRemove(uuid, out var tcs))
-                            tcs.TrySetResult(true);
+                        if (_playbackWaiters.TryGetValue(uuid, out var entry) &&
+                            string.Equals(entry.filePath, filePath, StringComparison.Ordinal))
+                        {
+                            if (_playbackWaiters.TryRemove(uuid, out _))
+                                entry.tcs.TrySetResult(true);
+                        }
                     }
                 });
         }
@@ -279,8 +289,8 @@ namespace ContactCenterPOC.Services
             try
             {
                 // Cancel any pending playback waiter so the queue processor unblocks immediately
-                if (_playbackWaiters.TryRemove(uuid, out var tcs))
-                    tcs.TrySetCanceled();
+                if (_playbackWaiters.TryRemove(uuid, out var entry))
+                    entry.tcs.TrySetCanceled();
                 var result = await _commandConn.SendApi($"uuid_break {uuid} all");
                 _logger.LogInformation("[{UUID}] BreakAudio: {Result}", uuid, result.BodyText?.Trim());
             }
@@ -294,14 +304,14 @@ namespace ContactCenterPOC.Services
         /// Wait for the current playback to finish on the given UUID.
         /// Returns when PLAYBACK_STOP fires, or after the fallback timeout.
         /// </summary>
-        public async Task WaitForPlaybackStopAsync(string uuid, int fallbackMs, CancellationToken ct)
+        public async Task WaitForPlaybackStopAsync(string uuid, string filePath, int fallbackMs, CancellationToken ct)
         {
             var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-            _playbackWaiters[uuid] = tcs;
+            _playbackWaiters[uuid] = (tcs, filePath);
             using var reg = ct.Register(() =>
             {
                 if (_playbackWaiters.TryRemove(uuid, out var w))
-                    w.TrySetCanceled();
+                    w.tcs.TrySetCanceled();
             });
             try
             {

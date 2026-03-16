@@ -463,6 +463,25 @@ namespace ContactCenterPOC.Services
             }
         }
 
+        /// <summary>
+        /// Clear the server-side input audio buffer.
+        /// Called after AI playback finishes to give VAD a clean slate
+        /// (accumulated silence/echo can prevent speech detection onset).
+        /// </summary>
+        public async Task ClearInputAudioBufferAsync()
+        {
+            try
+            {
+                var clearCmd = BinaryData.FromString("{\"type\":\"input_audio_buffer.clear\"}");
+                await m_aiSession.SendCommandAsync(clearCmd, null);
+                _log.Info("Sent input_audio_buffer.clear");
+            }
+            catch (Exception ex)
+            {
+                _log.Warn(ex, "Failed to send input_audio_buffer.clear");
+            }
+        }
+
         public void Close()
         {
             m_cts.Cancel();

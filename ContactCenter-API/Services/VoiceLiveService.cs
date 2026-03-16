@@ -435,6 +435,27 @@ namespace ContactCenterPOC.Services
             }
         }
 
+        /// <summary>
+        /// Clear the server-side input audio buffer.
+        /// Called after AI playback finishes to give VAD a clean slate.
+        /// </summary>
+        public async Task ClearInputAudioBufferAsync()
+        {
+            try
+            {
+                if (m_session != null)
+                {
+                    var clearCmd = BinaryData.FromString("{\"type\":\"input_audio_buffer.clear\"}");
+                    await m_session.SendCommandAsync(clearCmd);
+                    _log.Info("Sent input_audio_buffer.clear");
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.Warn(ex, "Failed to send input_audio_buffer.clear (VoiceLive may not support it)");
+            }
+        }
+
         private void FireAndForgetSentiment(TranscriptEntry entry)
         {
             if (_sentimentService == null) return;

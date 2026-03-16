@@ -276,7 +276,7 @@ namespace ContactCenterPOC.Models
                     {
                         try
                         {
-                            await _freeSwitchService.WaitForPlaybackStopAsync(_callConnectionId, fallbackMs, _cts.Token);
+                            await _freeSwitchService.WaitForPlaybackStopAsync(_callConnectionId, item.filePath, fallbackMs, _cts.Token);
                         }
                         catch (OperationCanceledException) when (!_cts.IsCancellationRequested)
                         {
@@ -285,6 +285,23 @@ namespace ContactCenterPOC.Models
                     }
                 }
                 _isPlayingBack = false;
+
+                // Clear OpenAI's input audio buffer after playback ends.
+                // Accumulated silence/echo during mute can leave server-side VAD in a
+                // state where it won't detect the onset of real speech.
+                try
+                {
+                    if (_aiServiceHandler != null)
+                        await _aiServiceHandler.ClearInputAudioBufferAsync();
+                    else if (_vlServiceHandler != null)
+                        await _vlServiceHandler.ClearInputAudioBufferAsync();
+                    _log.Info("Input audio buffer cleared, ready for user speech");
+                }
+                catch (Exception ex)
+                {
+                    _log.Warn(ex, "Failed to clear input audio buffer");
+                }
+
                 _log.Info("Playback queue empty, upstream unmuted");
             }
             catch (OperationCanceledException) { }
