@@ -74,7 +74,7 @@ namespace ContactCenterPOC.Services
                     var uuid = evt.Headers.ContainsKey("Unique-ID") ? evt.Headers["Unique-ID"] : "";
                     if (!string.IsNullOrEmpty(uuid))
                     {
-                        _logger.LogInformation("FreeSWITCH call answered: {UUID}", uuid);
+                        _logger.LogInformation("[{UUID}] ESL event: call answered", uuid);
                         CallAnswered?.Invoke(uuid);
                     }
                 });
@@ -86,7 +86,7 @@ namespace ContactCenterPOC.Services
                     var cause = evt.Headers.ContainsKey("Hangup-Cause") ? evt.Headers["Hangup-Cause"] : "unknown";
                     if (!string.IsNullOrEmpty(uuid))
                     {
-                        _logger.LogInformation("FreeSWITCH call hangup: {UUID}, cause: {Cause}", uuid, cause);
+                        _logger.LogInformation("[{UUID}] Call hangup, cause: {Cause}", uuid, cause);
                         // Clean up any pending playback waiter
                         if (_playbackWaiters.TryRemove(uuid, out var tcs))
                             tcs.TrySetCanceled();
@@ -109,7 +109,7 @@ namespace ContactCenterPOC.Services
                     if (!string.IsNullOrEmpty(uuid))
                     {
                         var filePath = evt.Headers.ContainsKey("Playback-File-Path") ? evt.Headers["Playback-File-Path"] : "";
-                        _logger.LogInformation("FreeSWITCH PLAYBACK_STOP: {UUID}, file={File}", uuid, filePath);
+                        _logger.LogInformation("[{UUID}] PLAYBACK_STOP, file={File}", uuid, filePath);
                         if (_playbackWaiters.TryRemove(uuid, out var tcs))
                             tcs.TrySetResult(true);
                     }
@@ -150,7 +150,7 @@ namespace ContactCenterPOC.Services
                 $"effective_caller_id_name={callerIdName}" +
                 $"}}sofia/gateway/{gateway}/{dialString} {transferTarget} XML {transferContext} '{callerIdName}' '{callerIdNumber}'";
 
-            _logger.LogInformation("Originating outbound call: uuid={UUID}, target={Target}, dial={Dial}, gateway={Gateway}, extension={Transfer}@{Context}",
+            _logger.LogInformation("[{UUID}] Originating outbound call: target={Target}, dial={Dial}, gateway={Gateway}, extension={Transfer}@{Context}",
                 uuid, targetPhoneNumber, dialString, gateway, transferTarget, transferContext);
 
             var result = await _commandConn.SendApi(originateCmd);
@@ -158,7 +158,7 @@ namespace ContactCenterPOC.Services
 
             if (body.StartsWith("+OK"))
             {
-                _logger.LogInformation("Call originated successfully: {UUID}", uuid);
+                _logger.LogInformation("[{UUID}] Call originated successfully", uuid);
                 return uuid;
             }
             else if (body.StartsWith("-ERR"))
@@ -179,11 +179,11 @@ namespace ContactCenterPOC.Services
 
             var target = targetExtension ?? _configuration["FreeSWITCH:TransferTarget"] ?? "1800123456";
             var cmd = $"uuid_transfer {uuid} {target}";
-            _logger.LogInformation("Transferring call {UUID} to {Target}", uuid, target);
+            _logger.LogInformation("[{UUID}] Transferring to {Target}", uuid, target);
 
             var result = await _commandConn.SendApi(cmd);
             var body = result.BodyText?.Trim() ?? "";
-            _logger.LogInformation("Transfer result for {UUID}: {Result}", uuid, body);
+            _logger.LogInformation("[{UUID}] Transfer result: {Result}", uuid, body);
         }
 
         /// <summary>
@@ -208,18 +208,18 @@ namespace ContactCenterPOC.Services
         {
             if (_commandConn == null)
             {
-                _logger.LogWarning("Cannot hang up {UUID}: FreeSWITCH not connected", uuid);
+                _logger.LogWarning("[{UUID}] Cannot hang up: FreeSWITCH not connected", uuid);
                 return;
             }
 
             try
             {
                 var result = await _commandConn.SendApi($"uuid_kill {uuid}");
-                _logger.LogInformation("Hangup {UUID}: {Result}", uuid, result.BodyText?.Trim());
+                _logger.LogInformation("[{UUID}] Hangup result: {Result}", uuid, result.BodyText?.Trim());
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to hang up call {UUID}", uuid);
+                _logger.LogError(ex, "[{UUID}] Failed to hang up call", uuid);
             }
         }
 
@@ -234,21 +234,21 @@ namespace ContactCenterPOC.Services
             // Try reconnect if not connected
             if (_commandConn == null)
             {
-                _logger.LogWarning("PlayAudioAsync: ESL command connection is null, attempting reconnect...");
+                _logger.LogWarning("[{UUID}] PlayAudioAsync: ESL command connection is null, attempting reconnect...", uuid);
                 await ConnectAsync();
             }
 
             if (_commandConn == null)
             {
-                _logger.LogError("PlayAudioAsync: ESL reconnect failed, cannot play audio for {UUID}", uuid);
+                _logger.LogError("[{UUID}] PlayAudioAsync: ESL reconnect failed, cannot play audio", uuid);
                 return "-ERR not connected";
             }
 
             var cmd = $"uuid_broadcast {uuid} {filePath} aleg";
-            _logger.LogInformation("PlayAudioAsync: Sending ESL command: {Cmd}", cmd);
+            _logger.LogInformation("[{UUID}] PlayAudioAsync: Sending ESL command: {Cmd}", uuid, cmd);
             var result = await _commandConn.SendApi(cmd);
             var body = result.BodyText?.Trim() ?? "(no body)";
-            _logger.LogInformation("PlayAudioAsync: ESL response: {Response}", body);
+            _logger.LogInformation("[{UUID}] PlayAudioAsync: ESL response: {Response}", uuid, body);
             return body;
         }
 
@@ -264,11 +264,11 @@ namespace ContactCenterPOC.Services
                 if (_playbackWaiters.TryRemove(uuid, out var tcs))
                     tcs.TrySetCanceled();
                 var result = await _commandConn.SendApi($"uuid_break {uuid} all");
-                _logger.LogInformation("BreakAudio {UUID}: {Result}", uuid, result.BodyText?.Trim());
+                _logger.LogInformation("[{UUID}] BreakAudio: {Result}", uuid, result.BodyText?.Trim());
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "BreakAudio failed for {UUID}", uuid);
+                _logger.LogWarning(ex, "[{UUID}] BreakAudio failed", uuid);
             }
         }
 
@@ -291,7 +291,7 @@ namespace ContactCenterPOC.Services
                 var winner = await Task.WhenAny(tcs.Task, Task.Delay(fallbackMs, ct));
                 if (winner != tcs.Task)
                 {
-                    _logger.LogWarning("WaitForPlaybackStop {UUID}: fallback timeout {Ms}ms elapsed", uuid, fallbackMs);
+                    _logger.LogWarning("[{UUID}] WaitForPlaybackStop: fallback timeout {Ms}ms elapsed", uuid, fallbackMs);
                     _playbackWaiters.TryRemove(uuid, out _);
                 }
             }
@@ -308,11 +308,11 @@ namespace ContactCenterPOC.Services
             try
             {
                 var result = await _commandConn.SendApi($"uuid_audio_stream {uuid} pause");
-                _logger.LogDebug("PauseStream {UUID}: {Result}", uuid, result.BodyText?.Trim());
+                _logger.LogDebug("[{UUID}] PauseStream: {Result}", uuid, result.BodyText?.Trim());
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "PauseStream failed for {UUID}", uuid);
+                _logger.LogWarning(ex, "[{UUID}] PauseStream failed", uuid);
             }
         }
 
@@ -325,11 +325,11 @@ namespace ContactCenterPOC.Services
             try
             {
                 var result = await _commandConn.SendApi($"uuid_audio_stream {uuid} resume");
-                _logger.LogDebug("ResumeStream {UUID}: {Result}", uuid, result.BodyText?.Trim());
+                _logger.LogDebug("[{UUID}] ResumeStream: {Result}", uuid, result.BodyText?.Trim());
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "ResumeStream failed for {UUID}", uuid);
+                _logger.LogWarning(ex, "[{UUID}] ResumeStream failed", uuid);
             }
         }
 

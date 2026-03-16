@@ -13,6 +13,7 @@ namespace ContactCenterPOC.Services
         private VoiceLiveSession? m_session;
         private IMediaStreamingHandler m_mediaStreaming;
         private readonly ILogger<CallService> _logger;
+        private readonly CallLogger _log;
         private readonly IHubContext<TranscriptHub> _hubContext;
         private readonly string _callConnectionId;
         private readonly Func<string, Task>? _hangUpCallback;
@@ -46,6 +47,7 @@ namespace ContactCenterPOC.Services
             m_mediaStreaming = mediaStreaming;
             m_cts = new CancellationTokenSource();
             _logger = logger;
+            _log = new CallLogger(logger, callConnectionId, "VL");
             _hubContext = hubContext;
             _callConnectionId = callConnectionId;
             _hangUpCallback = hangUpCallback;
@@ -59,15 +61,15 @@ namespace ContactCenterPOC.Services
 
             try
             {
-                _logger.LogInformation("[VL-{CallId}] Creating VoiceLive session (model={Model}, voice={Voice})...",
-                    callConnectionId, _model, _selectedVoice);
+                _log.Info("Creating VoiceLive session (model={Model}, voice={Voice})...",
+                    _model, _selectedVoice);
                 m_session = CreateSessionAsync().GetAwaiter().GetResult();
                 _sessionReady = true;
-                _logger.LogInformation("[VL-{CallId}] VoiceLive session created successfully", callConnectionId);
+                _log.Info("VoiceLive session created successfully");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "[VL-{CallId}] FAILED to create VoiceLive session", callConnectionId);
+                _log.Error(ex, "FAILED to create VoiceLive session");
                 throw;
             }
         }
@@ -80,15 +82,15 @@ namespace ContactCenterPOC.Services
             if (!string.IsNullOrWhiteSpace(_voiceLiveConfig.Key))
             {
                 client = new VoiceLiveClient(endpoint, new Azure.AzureKeyCredential(_voiceLiveConfig.Key));
-                _logger.LogInformation("[VL-{CallId}] Using API key authentication", _callConnectionId);
+                _log.Info("Using API key authentication");
             }
             else
             {
                 client = new VoiceLiveClient(endpoint, new DefaultAzureCredential());
-                _logger.LogInformation("[VL-{CallId}] Using DefaultAzureCredential (Managed Identity)", _callConnectionId);
+                _log.Info("Using DefaultAzureCredential (Managed Identity)");
             }
 
-            _logger.LogInformation("[VL-{CallId}] Starting session with model '{Model}'...", _callConnectionId, _model);
+            _log.Info("Starting session with model '{Model}'...", _model);
             var session = await client.StartSessionAsync(_model);
 
             // Configure session options
@@ -105,18 +107,18 @@ namespace ContactCenterPOC.Services
             };
 
             await session.ConfigureSessionAsync(options);
-            _logger.LogInformation("[VL-{CallId}] Session configured (voice={Voice}, format=PCM16, echo cancel + noise reduction + semantic VAD)",
-                _callConnectionId, _selectedVoice);
+            _log.Info("Session configured (voice={Voice}, format=PCM16, echo cancel + noise reduction + semantic VAD)",
+                _selectedVoice);
 
             return session;
         }
 
         public void StartConversation()
         {
-            _logger.LogInformation("[VL-{CallId}] StartConversation called, sessionReady={Ready}", _callConnectionId, _sessionReady);
+            _log.Info("StartConversation called, sessionReady={Ready}", _sessionReady);
             if (!_sessionReady || m_session == null)
             {
-                _logger.LogError("[VL-{CallId}] Cannot start conversation - session not ready", _callConnectionId);
+                _log.Error("Cannot start conversation - session not ready");
                 return;
             }
 
@@ -128,7 +130,7 @@ namespace ContactCenterPOC.Services
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "[VL-{CallId}] Unhandled exception in VoiceLive response task", _callConnectionId);
+                    _log.Error(ex, "Unhandled exception in VoiceLive response task");
                 }
             });
         }
@@ -143,22 +145,22 @@ namespace ContactCenterPOC.Services
             {
                 if (m_session == null) return;
 
-                _logger.LogInformation("[VL-{CallId}] Starting VoiceLive initial response...", _callConnectionId);
+                _log.Info("Starting VoiceLive initial response...");
                 await m_session.StartResponseAsync();
-                _logger.LogInformation("[VL-{CallId}] Listening for VoiceLive updates...", _callConnectionId);
+                _log.Info("Listening for VoiceLive updates...");
                 int audioChunkCount = 0;
 
                 await foreach (SessionUpdate update in m_session.GetUpdatesAsync(m_cts.Token))
                 {
                     if (update is SessionUpdateSessionCreated sessionCreated)
                     {
-                        _logger.LogInformation("[VL-{CallId}] Session created", _callConnectionId);
+                        _log.Info("Session created");
                     }
 
                     // User barge-in: speech started
                     if (update is SessionUpdateInputAudioBufferSpeechStarted speechStarted)
                     {
-                        _logger.LogInformation("[VL-{CallId}] Voice activity detection started", _callConnectionId);
+                        _log.Info("Voice activity detection started");
                         var jsonString = MediaStreamingData.GetStopAudioForOutbound();
                         await m_mediaStreaming.SendMessageAsync(jsonString);
                     }
@@ -171,8 +173,8 @@ namespace ContactCenterPOC.Services
                             audioChunkCount++;
                             if (audioChunkCount <= 3 || audioChunkCount % 50 == 0)
                             {
-                                _logger.LogInformation("[VL-{CallId}] Sending audio chunk #{ChunkNum} to ACS",
-                                    _callConnectionId, audioChunkCount);
+                                _log.Info("Sending audio chunk #{ChunkNum} to ACS",
+                                    audioChunkCount);
                             }
                             var audioBytes = audioDelta.Delta.ToArray();
                             var jsonString = MediaStreamingData.GetAudioDataForOutbound(audioBytes);
@@ -189,7 +191,7 @@ namespace ContactCenterPOC.Services
                     // AI transcript done (complete)
                     if (update is SessionUpdateResponseAudioTranscriptDone transcriptDone)
                     {
-                        _logger.LogInformation("[VL-{CallId}] AI transcript: {Transcript}", _callConnectionId, transcriptDone.Transcript);
+                        _log.Info("AI transcript: {Transcript}", transcriptDone.Transcript);
                         var aiEntry = new TranscriptEntry
                         {
                             CallConnectionId = _callConnectionId,
@@ -216,7 +218,7 @@ namespace ContactCenterPOC.Services
                     // User transcript completed
                     if (update is SessionUpdateConversationItemInputAudioTranscriptionCompleted userTranscript)
                     {
-                        _logger.LogInformation("[VL-{CallId}] User audio transcript: {Transcript}", _callConnectionId, userTranscript.Transcript);
+                        _log.Info("User audio transcript: {Transcript}", userTranscript.Transcript);
                         var recipientEntry = new TranscriptEntry
                         {
                             CallConnectionId = _callConnectionId,
@@ -243,8 +245,8 @@ namespace ContactCenterPOC.Services
                     // Response done
                     if (update is SessionUpdateResponseDone responseDone)
                     {
-                        _logger.LogInformation("[VL-{CallId}] Response turn finished. Total audio chunks: {ChunkCount}",
-                            _callConnectionId, audioChunkCount);
+                        _log.Info("Response turn finished. Total audio chunks: {ChunkCount}",
+                            audioChunkCount);
                     }
 
                     // Error handling
@@ -252,8 +254,8 @@ namespace ContactCenterPOC.Services
                     {
                         var errorCode = errorUpdate.Error?.Code;
                         var errorMessage = errorUpdate.Error?.Message;
-                        _logger.LogError("[VL-{CallId}] VoiceLive error: code={Code}, message={Message}",
-                            _callConnectionId, errorCode, errorMessage);
+                        _log.Error("VoiceLive error: code={Code}, message={Message}",
+                            errorCode, errorMessage);
 
                         // FR-024: Rate-limit / quota errors — notify operator, don't retry
                         if (IsRateLimitOrQuotaError(errorCode))
@@ -288,16 +290,16 @@ namespace ContactCenterPOC.Services
                     }
                 }
 
-                _logger.LogInformation("[VL-{CallId}] VoiceLive response loop ended. Total audio chunks: {ChunkCount}",
-                    _callConnectionId, audioChunkCount);
+                _log.Info("VoiceLive response loop ended. Total audio chunks: {ChunkCount}",
+                    audioChunkCount);
             }
             catch (OperationCanceledException)
             {
-                _logger.LogInformation("[VL-{CallId}] VoiceLive response loop cancelled", _callConnectionId);
+                _log.Info("VoiceLive response loop cancelled");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "[VL-{CallId}] Exception during VoiceLive streaming", _callConnectionId);
+                _log.Error(ex, "Exception during VoiceLive streaming");
 
                 // Attempt reconnection on unexpected exceptions
                 var reconnected = await AttemptReconnectionAsync();
@@ -306,7 +308,7 @@ namespace ContactCenterPOC.Services
                     if (_hangUpCallback != null)
                     {
                         try { await _hangUpCallback(_callConnectionId); }
-                        catch (Exception cbEx) { _logger.LogWarning(cbEx, "[VL-{CallId}] Hang-up callback failed after VoiceLive error", _callConnectionId); }
+                        catch (Exception cbEx) { _log.Warn(cbEx, "Hang-up callback failed after VoiceLive error"); }
                     }
                 }
                 // If reconnected, set shouldRetry to re-enter the while loop
@@ -332,13 +334,13 @@ namespace ContactCenterPOC.Services
                     // Check if operator has aborted (CancellationToken cancelled = hang up)
                     if (activeCall.CancellationTokenSource.IsCancellationRequested)
                     {
-                        _logger.LogInformation("[VL-{CallId}] Operator aborted during reconnection", _callConnectionId);
+                        _log.Info("Operator aborted during reconnection");
                         return false;
                     }
                 }
 
                 // FR-019: Emit Reconnecting status via SignalR
-                _logger.LogWarning("[VL-{CallId}] Reconnection attempt {Attempt}/{Max}...", _callConnectionId, attempt, MaxReconnectAttempts);
+                _log.Warn("Reconnection attempt {Attempt}/{Max}...", attempt, MaxReconnectAttempts);
                 await _hubContext.Clients.Group(_callConnectionId)
                     .SendAsync("CallStatusChanged", new
                     {
@@ -364,7 +366,7 @@ namespace ContactCenterPOC.Services
                     _sessionReady = true;
                     await m_session.StartResponseAsync();
 
-                    _logger.LogInformation("[VL-{CallId}] Reconnection successful on attempt {Attempt}", _callConnectionId, attempt);
+                    _log.Info("Reconnection successful on attempt {Attempt}", attempt);
 
                     // Update status back to Connected
                     if (_activeCalls != null && _activeCalls.TryGetValue(_callConnectionId, out var callAfterReconnect))
@@ -384,12 +386,12 @@ namespace ContactCenterPOC.Services
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "[VL-{CallId}] Reconnection attempt {Attempt} failed", _callConnectionId, attempt);
+                    _log.Warn(ex, "Reconnection attempt {Attempt} failed", attempt);
                 }
             }
 
             // All attempts exhausted
-            _logger.LogError("[VL-{CallId}] All {Max} reconnection attempts failed", _callConnectionId, MaxReconnectAttempts);
+            _log.Error("All {Max} reconnection attempts failed", MaxReconnectAttempts);
 
             // FR-019: Emit ReconnectFailed status
             await _hubContext.Clients.Group(_callConnectionId)
@@ -428,8 +430,8 @@ namespace ContactCenterPOC.Services
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "[VL-{CallId}] Failed to send audio to VoiceLive ({ByteCount} bytes)",
-                    _callConnectionId, memoryStream.Length);
+                _log.Error(ex, "Failed to send audio to VoiceLive ({ByteCount} bytes)",
+                    memoryStream.Length);
             }
         }
 
@@ -474,7 +476,7 @@ namespace ContactCenterPOC.Services
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "[VL-{CallId}] Sentiment analysis failed for entry", _callConnectionId);
+                    _log.Warn(ex, "Sentiment analysis failed for entry");
                 }
             });
         }
@@ -520,7 +522,7 @@ namespace ContactCenterPOC.Services
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "[VL-{CallId}] Emotion analysis failed for entry", _callConnectionId);
+                    _log.Warn(ex, "Emotion analysis failed for entry");
                 }
             });
         }

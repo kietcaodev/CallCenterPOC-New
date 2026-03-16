@@ -79,17 +79,17 @@ namespace ContactCenterPOC.Services
                     campaignTitle = activeCall.CampaignTitle
                 });
 
-                _logger.LogInformation("FreeSWITCH call answered: {UUID}", uuid);
+                _logger.LogInformation("[{UUID}] Call status updated to Connected", uuid);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error handling FreeSWITCH call answered for {UUID}", uuid);
+                _logger.LogError(ex, "[{UUID}] Error handling call answered event", uuid);
             }
         }
 
         private void OnFreeSwitchCallHangup(string uuid, string cause)
         {
-            _logger.LogInformation("FreeSWITCH call hangup event: {UUID}, cause: {Cause}", uuid, cause);
+            _logger.LogInformation("[{UUID}] Call hangup event, cause: {Cause}", uuid, cause);
             _ = CleanupCall(uuid);
         }
 
@@ -177,11 +177,15 @@ namespace ContactCenterPOC.Services
                 if (contactName != null)
                 {
                     callPrompt = $"IMPORTANT: The person you are calling is named {contactName}. You MUST greet them by name at the start of the conversation, for example: 'Hello {contactName}'. " + callPrompt;
-                    _logger.LogInformation("Call to {PhoneNumber} will greet contact as '{ContactName}'", targetPhoneNumber, contactName);
                 }
 
                 // Originate call via FreeSWITCH ESL (transfer to mod_audio_stream on answer)
                 var callConnectionId = await _freeSwitchService.OriginateOutboundCallAsync(targetPhoneNumber);
+
+                if (contactName != null)
+                {
+                    _logger.LogInformation("[{CallConnectionId}] Call to {PhoneNumber} will greet contact as '{ContactName}'", callConnectionId, targetPhoneNumber, contactName);
+                }
 
                 var activeCall = new ActiveCall
                 {
@@ -215,7 +219,7 @@ namespace ContactCenterPOC.Services
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogWarning(ex, "Failed to load settings for max call time, using default {Default}min", maxCallMinutes);
+                        _logger.LogWarning(ex, "[{CallConnectionId}] Failed to load settings for max call time, using default {Default}min", callConnectionId, maxCallMinutes);
                     }
                 }
 
@@ -225,14 +229,14 @@ namespace ContactCenterPOC.Services
                 activeCall.VoiceLiveVoice = frozenVoiceApiMode == "VoiceLive" ? frozenVoiceLiveVoice : null;
 
                 // FR-015: Log engine type, voice, and model when call starts
-                _logger.LogInformation("Call {CallConnectionId} initiated: engine={Engine}, voice={Voice}, model={Model}",
+                _logger.LogInformation("[{CallConnectionId}] Call initiated: engine={Engine}, voice={Voice}, model={Model}",
                     callConnectionId, frozenVoiceApiMode,
                     frozenVoiceApiMode == "VoiceLive" ? frozenVoiceLiveVoice : frozenSelectedVoice,
                     frozenVoiceApiMode == "VoiceLive" ? frozenVoiceLiveModel : "N/A");
                 activeCall.CancellationTokenSource.CancelAfter(TimeSpan.FromMinutes(maxCallMinutes));
                 activeCall.CancellationTokenSource.Token.Register(async () =>
                 {
-                    _logger.LogInformation("Call {CallConnectionId} auto-terminated after {MaxMinutes} minutes", callConnectionId, maxCallMinutes);
+                    _logger.LogInformation("[{CallConnectionId}] Auto-terminated after {MaxMinutes} minutes", callConnectionId, maxCallMinutes);
                     await HangUpCall(callConnectionId);
                 });
 
@@ -278,8 +282,9 @@ namespace ContactCenterPOC.Services
                 return;
             }
 
+            var log = new CallLogger(_logger, callId);
             var ws = await httpContext.WebSockets.AcceptWebSocketAsync();
-            _logger.LogInformation("FreeSWITCH WebSocket connected for callId {CallId}", callId);
+            log.Info("FreeSWITCH WebSocket connected");
 
             if (ws.State != WebSocketState.Open) return;
 
@@ -296,7 +301,7 @@ namespace ContactCenterPOC.Services
             // FR-010/FR-013: Check VoiceLive configuration before proceeding
             if (activeCall.VoiceApiMode == "VoiceLive" && !_voiceLiveConfig.IsConfigured)
             {
-                _logger.LogWarning("VoiceLive call attempted but endpoint not configured for {CallConnectionId}", callConnectionId);
+                log.Warn("VoiceLive call attempted but endpoint not configured");
                 await _hubContext.Clients.Group(callConnectionId)
                     .SendAsync("CallStatusChanged", new
                     {
@@ -321,7 +326,7 @@ namespace ContactCenterPOC.Services
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Failed to read voice setting, using defaults");
+                    log.Warn(ex, "Failed to read voice setting, using defaults");
                 }
             }
 
@@ -354,13 +359,13 @@ namespace ContactCenterPOC.Services
             finally
             {
                 // WebSocket closed — cleanup
-                _logger.LogInformation("WebSocket disconnected for callId {CallId}", callId);
+                log.Info("WebSocket disconnected");
 
                 // Try to hang up via ESL if connected (graceful — won't error if not connected)
                 if (_freeSwitchService.IsConnected)
                 {
                     try { await _freeSwitchService.HangUpAsync(callConnectionId); }
-                    catch (Exception ex) { _logger.LogWarning(ex, "ESL hangup failed for {CallId}", callId); }
+                    catch (Exception ex) { log.Warn(ex, "ESL hangup failed"); }
                 }
 
                 await CleanupCall(callConnectionId);
@@ -423,7 +428,7 @@ namespace ContactCenterPOC.Services
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Failed to load settings for WebSocket call, using defaults");
+                    _logger.LogWarning(ex, "[{CallId}] Failed to load settings for WebSocket call, using defaults", callId);
                 }
             }
 
@@ -448,14 +453,14 @@ namespace ContactCenterPOC.Services
             activeCall.CancellationTokenSource.CancelAfter(TimeSpan.FromMinutes(maxCallMinutes));
             activeCall.CancellationTokenSource.Token.Register(async () =>
             {
-                _logger.LogInformation("Call {CallId} auto-terminated after {MaxMinutes} minutes", callId, maxCallMinutes);
+                _logger.LogInformation("[{CallId}] Auto-terminated after {MaxMinutes} minutes", callId, maxCallMinutes);
                 await HangUpCall(callId);
             });
 
             _activeCalls[callId] = activeCall;
 
             _logger.LogInformation(
-                "Created ActiveCall from WebSocket: callId={CallId}, phone={Phone}, engine={Engine}, campaign={Campaign}",
+                "[{CallId}] Created ActiveCall from WebSocket: phone={Phone}, engine={Engine}, campaign={Campaign}",
                 callId, phoneNumber, frozenVoiceApiMode, resolvedCampaignId);
 
             // Persist initial record
@@ -500,12 +505,12 @@ namespace ContactCenterPOC.Services
                 }
                 else
                 {
-                    _logger.LogInformation("ESL not connected, skipping ESL hangup for {CallConnectionId}", callConnectionId);
+                    _logger.LogInformation("[{CallConnectionId}] ESL not connected, skipping hangup", callConnectionId);
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error hanging up call {CallConnectionId}", callConnectionId);
+                _logger.LogError(ex, "[{CallConnectionId}] Error hanging up call", callConnectionId);
             }
             finally
             {
@@ -515,7 +520,7 @@ namespace ContactCenterPOC.Services
 
         public async Task CleanupCall(string callConnectionId)
         {
-            _logger.LogInformation("Cleaning up call {CallConnectionId}", callConnectionId);
+            _logger.LogInformation("[{CallConnectionId}] Cleaning up call", callConnectionId);
 
             if (_activeCalls.TryRemove(callConnectionId, out var activeCall))
             {
@@ -599,7 +604,7 @@ namespace ContactCenterPOC.Services
                         }
                         catch (Exception ex)
                         {
-                            _logger.LogWarning(ex, "Failed to compute operator style traits for {CallConnectionId}", activeCall.CallConnectionId);
+                            _logger.LogWarning(ex, "[{CallConnectionId}] Failed to compute operator style traits", activeCall.CallConnectionId);
                         }
                     }
                 }
@@ -642,19 +647,19 @@ namespace ContactCenterPOC.Services
                                 callRecord.CallSummary = summary;
                                 callRecord.SummarizedAt = DateTimeOffset.UtcNow;
                                 await _callHistoryService.SaveCallRecordAsync(callRecord);
-                                _logger.LogInformation("Post-call summary generated for {CallConnectionId}", activeCall.CallConnectionId);
+                                _logger.LogInformation("[{CallConnectionId}] Post-call summary generated", activeCall.CallConnectionId);
                             }
                         }
                         catch (Exception summaryEx)
                         {
-                            _logger.LogWarning(summaryEx, "Failed to generate post-call summary for {CallConnectionId}", activeCall.CallConnectionId);
+                            _logger.LogWarning(summaryEx, "[{CallConnectionId}] Failed to generate post-call summary", activeCall.CallConnectionId);
                         }
                     });
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Failed to persist call history during cleanup for {CallConnectionId}", activeCall.CallConnectionId);
+                _logger.LogWarning(ex, "[{CallConnectionId}] Failed to persist call history during cleanup", activeCall.CallConnectionId);
             }
         }
 
@@ -662,7 +667,7 @@ namespace ContactCenterPOC.Services
         {
             // Recording via FreeSWITCH is handled separately (uuid_record command)
             // Not yet implemented - stub for compatibility
-            _logger.LogInformation("Recording not yet implemented for FreeSWITCH call {CallConnectionId}", callConnectionId);
+            _logger.LogInformation("[{CallConnectionId}] Recording not yet implemented for FreeSWITCH", callConnectionId);
             return Task.CompletedTask;
         }
 

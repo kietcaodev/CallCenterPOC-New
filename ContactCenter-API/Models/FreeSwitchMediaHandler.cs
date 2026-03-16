@@ -20,6 +20,7 @@ namespace ContactCenterPOC.Models
         private VoiceLiveService? _vlServiceHandler;
         private readonly IConfiguration _configuration;
         private readonly ILogger<CallService> _logger;
+        private readonly CallLogger _log;
         private readonly IHubContext<TranscriptHub> _hubContext;
         private readonly string _callConnectionId;
         private readonly Func<string, Task>? _hangUpCallback;
@@ -77,6 +78,7 @@ namespace ContactCenterPOC.Models
             _configuration = configuration;
             _cts = new CancellationTokenSource();
             _logger = logger;
+            _log = new CallLogger(logger, callConnectionId, "FS");
             _hubContext = hubContext;
             _callConnectionId = callConnectionId;
             _hangUpCallback = hangUpCallback;
@@ -100,7 +102,7 @@ namespace ContactCenterPOC.Models
 
             if (_voiceApiMode == "VoiceLive" && _voiceLiveConfig != null && _voiceLiveConfig.IsConfigured)
             {
-                _logger.LogInformation("[FS-{CallId}] Dispatching to VoiceLiveService", _callConnectionId);
+                _log.Info("Dispatching to VoiceLiveService");
                 _vlServiceHandler = new VoiceLiveService(
                     this, callContextPrompt, _voiceLiveConfig, _logger, _hubContext,
                     _callConnectionId, _voiceLiveModel ?? "gpt-4o", _selectedVoiceLiveVoice,
@@ -113,7 +115,7 @@ namespace ContactCenterPOC.Models
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "[FS-{CallId}] VoiceLive WebSocket error", _callConnectionId);
+                    _log.Error(ex, "VoiceLive WebSocket error");
                 }
                 finally
                 {
@@ -124,8 +126,8 @@ namespace ContactCenterPOC.Models
             }
             else
             {
-                _logger.LogInformation("[FS-{CallId}] Dispatching to AzureOpenAIService (voice={Voice})",
-                    _callConnectionId, _selectedVoice);
+                _log.Info("Dispatching to AzureOpenAIService (voice={Voice})",
+                    _selectedVoice);
                 _aiServiceHandler = new AzureOpenAIService(
                     this, callContextPrompt, _configuration, _logger, _hubContext,
                     _callConnectionId, _hangUpCallback, _sentimentService, _activeCalls,
@@ -138,7 +140,7 @@ namespace ContactCenterPOC.Models
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "[FS-{CallId}] OpenAI WebSocket error", _callConnectionId);
+                    _log.Error(ex, "OpenAI WebSocket error");
                 }
                 finally
                 {
@@ -167,8 +169,8 @@ namespace ContactCenterPOC.Models
                     var msSinceFlush = (DateTime.UtcNow - _lastFlushAt).TotalMilliseconds;
                     if (msSinceFlush < 600)
                     {
-                        _logger.LogInformation("[FS-{CallId}] Ignoring stale barge-in ({Elapsed}ms after flush)",
-                            _callConnectionId, (int)msSinceFlush);
+                        _log.Info("Ignoring stale barge-in ({Elapsed}ms after flush)",
+                            (int)msSinceFlush);
                         return;
                     }
 
@@ -181,7 +183,7 @@ namespace ContactCenterPOC.Models
                     {
                         await _freeSwitchService.BreakAudioAsync(_callConnectionId);
                     }
-                    _logger.LogInformation("[FS-{CallId}] Barge-in: stopped playback and cleared queue", _callConnectionId);
+                    _log.Info("Barge-in: stopped playback and cleared queue");
                     return;
                 }
 
@@ -203,7 +205,7 @@ namespace ContactCenterPOC.Models
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "[FS-{CallId}] Failed to buffer audio", _callConnectionId);
+                _log.Error(ex, "Failed to buffer audio");
             }
         }
 
@@ -229,8 +231,8 @@ namespace ContactCenterPOC.Models
                     await fs.WriteAsync(pcmData);
                 }
 
-                _logger.LogInformation("[FS-{CallId}] Wrote audio turn #{Turn} ({Bytes} bytes) to {Path}",
-                    _callConnectionId, _turnCounter, pcmData.Length, filePath);
+                _log.Info("Wrote audio turn #{Turn} ({Bytes} bytes) to {Path}",
+                    _turnCounter, pcmData.Length, filePath);
 
                 // Enqueue for sequential playback
                 _lastFlushAt = DateTime.UtcNow;
@@ -242,7 +244,7 @@ namespace ContactCenterPOC.Models
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "[FS-{CallId}] Failed to flush audio turn #{Turn}", _callConnectionId, _turnCounter);
+                _log.Error(ex, "Failed to flush audio turn #{Turn}", _turnCounter);
             }
         }
 
@@ -262,8 +264,8 @@ namespace ContactCenterPOC.Models
                     // Wait for FreeSWITCH PLAYBACK_STOP event instead of estimating duration.
                     // Fallback timeout = estimated duration + 2s safety margin in case event is lost.
                     var fallbackMs = (int)((double)item.pcmBytes / 32000 * 1000) + 2000;
-                    _logger.LogInformation("[FS-{CallId}] Waiting for PLAYBACK_STOP (fallback {Fallback}ms)",
-                        _callConnectionId, fallbackMs);
+                    _log.Info("Waiting for PLAYBACK_STOP (fallback {Fallback}ms)",
+                        fallbackMs);
                     if (_freeSwitchService != null)
                     {
                         try
@@ -272,12 +274,12 @@ namespace ContactCenterPOC.Models
                         }
                         catch (OperationCanceledException) when (!_cts.IsCancellationRequested)
                         {
-                            _logger.LogInformation("[FS-{CallId}] Playback wait cancelled by barge-in", _callConnectionId);
+                            _log.Info("Playback wait cancelled by barge-in");
                         }
                     }
                 }
                 _isPlayingBack = false;
-                _logger.LogInformation("[FS-{CallId}] Playback queue empty, upstream unmuted", _callConnectionId);
+                _log.Info("Playback queue empty, upstream unmuted");
             }
             catch (OperationCanceledException) { }
             finally
@@ -299,17 +301,17 @@ namespace ContactCenterPOC.Models
         {
             if (_freeSwitchService == null) return;
 
-            _logger.LogInformation("[FS-{CallId}] ESL IsConnected={Connected}, calling PlayAudioAsync for {Path}",
-                _callConnectionId, _freeSwitchService.IsConnected, filePath);
+            _log.Info("ESL IsConnected={Connected}, calling PlayAudioAsync for {Path}",
+                _freeSwitchService.IsConnected, filePath);
 
             try
             {
                 var result = await _freeSwitchService.PlayAudioAsync(_callConnectionId, filePath);
-                _logger.LogInformation("[FS-{CallId}] ESL uuid_broadcast result: {Result}", _callConnectionId, result);
+                _log.Info("ESL uuid_broadcast result: {Result}", result);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "[FS-{CallId}] ESL uuid_broadcast failed", _callConnectionId);
+                _log.Error(ex, "ESL uuid_broadcast failed");
             }
         }
 
@@ -397,7 +399,7 @@ namespace ContactCenterPOC.Models
 
             try
             {
-                _logger.LogInformation("[FS-{CallId}] Starting to receive audio from FreeSWITCH", _callConnectionId);
+                _log.Info("Starting to receive audio from FreeSWITCH");
                 var buffer = new byte[4096];
                 var messageBuffer = new MemoryStream();
                 int messageCount = 0;
@@ -408,8 +410,8 @@ namespace ContactCenterPOC.Models
 
                     if (result.MessageType == WebSocketMessageType.Close)
                     {
-                        _logger.LogInformation("[FS-{CallId}] WebSocket close received after {Count} messages",
-                            _callConnectionId, messageCount);
+                        _log.Info("WebSocket close received after {Count} messages",
+                            messageCount);
                         break;
                     }
 
@@ -446,21 +448,21 @@ namespace ContactCenterPOC.Models
                     {
                         // FreeSWITCH might send text messages (events) — log and skip
                         var textData = System.Text.Encoding.UTF8.GetString(buffer, 0, result.Count);
-                        _logger.LogInformation("[FS-{CallId}] Text message received: {Text}",
-                            _callConnectionId, textData.Length > 200 ? textData[..200] : textData);
+                        _log.Info("Text message received: {Text}",
+                            textData.Length > 200 ? textData[..200] : textData);
                     }
                 }
 
-                _logger.LogInformation("[FS-{CallId}] FreeSWITCH receive loop ended. Total messages: {Count}",
-                    _callConnectionId, messageCount);
+                _log.Info("FreeSWITCH receive loop ended. Total messages: {Count}",
+                    messageCount);
             }
             catch (OperationCanceledException)
             {
-                _logger.LogInformation("[FS-{CallId}] Receive loop cancelled", _callConnectionId);
+                _log.Info("Receive loop cancelled");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "[FS-{CallId}] Error in FreeSWITCH receive loop", _callConnectionId);
+                _log.Error(ex, "Error in FreeSWITCH receive loop");
             }
         }
 
@@ -474,7 +476,7 @@ namespace ContactCenterPOC.Models
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "[FS-{CallId}] Hang-up callback failed", _callConnectionId);
+                    _log.Error(ex, "Hang-up callback failed");
                 }
             }
         }

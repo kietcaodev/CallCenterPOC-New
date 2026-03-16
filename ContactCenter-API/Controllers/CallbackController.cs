@@ -52,7 +52,7 @@ namespace ContactCenterPOC.Controllers
             var effectiveCallId = callId ?? Guid.NewGuid().ToString();
 
             _logger.LogInformation(
-                "FreeSWITCH WebSocket connection: callId={CallId}, caller={Caller}, called={Called}, campaign={Campaign}",
+                "[{CallId}] FreeSWITCH WebSocket connection: caller={Caller}, called={Called}, campaign={Campaign}",
                 effectiveCallId, callerNumber, calledNumber, campaignId);
 
             await _callService.StartCallInteraction(

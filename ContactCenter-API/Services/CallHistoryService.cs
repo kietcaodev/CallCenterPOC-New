@@ -92,11 +92,11 @@ namespace ContactCenterPOC.Services
                     _cacheLock.Release();
                 }
 
-                _logger.LogInformation("Saved call record for {CallConnectionId}", record.CallConnectionId);
+                _logger.LogInformation("[{CallConnectionId}] Saved call record", record.CallConnectionId);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to save call record for {CallConnectionId}", record.CallConnectionId);
+                _logger.LogError(ex, "[{CallConnectionId}] Failed to save call record", record.CallConnectionId);
             }
         }
 
@@ -182,7 +182,7 @@ namespace ContactCenterPOC.Services
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to load call record {CallConnectionId}", callConnectionId);
+                _logger.LogError(ex, "[{CallConnectionId}] Failed to load call record", callConnectionId);
                 return null;
             }
         }
