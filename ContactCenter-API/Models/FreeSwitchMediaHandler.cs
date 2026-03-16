@@ -44,9 +44,14 @@ namespace ContactCenterPOC.Models
         // when real mic audio resumes after the gap.
         private static readonly byte[] SilenceFrame24k = new byte[960];
 
-        // Auto-flush threshold: flush buffer during generation every ~4 seconds of audio
-        // to avoid waiting for entire response before playback (PCM 16kHz mono 16-bit = 32000 bytes/sec)
-        private const int AutoFlushThresholdBytes = 128000;
+        // Auto-flush threshold: flush buffer during generation every ~1.5 seconds of audio
+        // to minimize silence gaps when AI generates slower than real-time.
+        // (PCM 16kHz mono 16-bit = 32000 bytes/sec, so 48000 = 1.5s)
+        private const int AutoFlushThresholdBytes = 48000;
+
+        // Minimum buffer size for an immediate flush (0.25s = 8000 bytes).
+        // Prevents micro-segments that would cause choppy playback via ESL.
+        private const int MinImmediateFlushBytes = 8000;
 
         // Buffer to accumulate audio chunks per AI turn, then play via ESL
         private readonly MemoryStream _audioBuffer = new();
@@ -58,6 +63,10 @@ namespace ContactCenterPOC.Models
 
         // True while uuid_broadcast is playing — mutes upstream audio to prevent echo
         private volatile bool _isPlayingBack;
+
+        // When set, the next AI audio chunk triggers an immediate flush regardless of threshold.
+        // Set when playback queue empties so the next audio segment plays without delay.
+        private volatile bool _flushOnNextChunk;
 
         // Timestamp of last FlushAudioAsync — used to ignore stale VAD events
         // (OpenAI delivers SpeechStarted AFTER ResponseFinished for already-processed speech)
@@ -203,7 +212,15 @@ namespace ContactCenterPOC.Models
                     // Auto-flush when buffer exceeds threshold for low-latency playback.
                     // Without this, long AI responses are fully buffered before any audio plays,
                     // causing 30+ seconds of silence until ResponseFinished.
-                    if (_audioBuffer.Length >= AutoFlushThresholdBytes)
+                    // Also flush immediately when _flushOnNextChunk is set (queue just emptied)
+                    // to minimize the silence gap between playback segments.
+                    var shouldFlush = _audioBuffer.Length >= AutoFlushThresholdBytes;
+                    if (!shouldFlush && _flushOnNextChunk && _audioBuffer.Length >= MinImmediateFlushBytes)
+                    {
+                        shouldFlush = true;
+                        _flushOnNextChunk = false;
+                    }
+                    if (shouldFlush)
                     {
                         await FlushAudioAsync();
                     }
@@ -285,6 +302,12 @@ namespace ContactCenterPOC.Models
                     }
                 }
                 _isPlayingBack = false;
+
+                // Signal SendMessageAsync to flush immediately on the next audio chunk.
+                // Without this, after a turn finishes playing, audio sits in the buffer
+                // until it reaches AutoFlushThresholdBytes — causing silence gaps when
+                // the AI generates audio slower than real-time.
+                _flushOnNextChunk = true;
 
                 // Clear OpenAI's input audio buffer after playback ends.
                 // Accumulated silence/echo during mute can leave server-side VAD in a
