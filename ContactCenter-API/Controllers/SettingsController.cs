@@ -29,6 +29,8 @@ namespace ContactCenterPOC.Controllers
                 settings.TranscriptionMode,
                 settings.VoiceLiveModel,
                 settings.SelectedVoiceLiveVoice,
+                settings.InboundCampaignId,
+                settings.InboundCustomPrompt,
                 VoiceLiveConfigured = _voiceLiveConfig.IsConfigured,
                 AvailableVoiceLiveVoices = VoiceLiveVoices.All,
                 AvailableVoiceLiveModels = OperatorSettings.ValidVoiceLiveModels.ToList()
@@ -53,6 +55,8 @@ namespace ContactCenterPOC.Controllers
                 saved.TranscriptionMode,
                 saved.VoiceLiveModel,
                 saved.SelectedVoiceLiveVoice,
+                saved.InboundCampaignId,
+                saved.InboundCustomPrompt,
                 VoiceLiveConfigured = _voiceLiveConfig.IsConfigured,
                 AvailableVoiceLiveVoices = VoiceLiveVoices.All,
                 AvailableVoiceLiveModels = OperatorSettings.ValidVoiceLiveModels.ToList()

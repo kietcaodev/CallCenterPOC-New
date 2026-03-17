@@ -11,6 +11,10 @@ namespace ContactCenterPOC.Models
         public string VoiceLiveModel { get; set; } = "gpt-4o";
         public string SelectedVoiceLiveVoice { get; set; } = "en-US-Ava:DragonHDLatestNeural";
 
+        // Inbound call script mapping
+        public string? InboundCampaignId { get; set; }        // Campaign to use for inbound calls (null = custom prompt or system default)
+        public string? InboundCustomPrompt { get; set; }      // Custom prompt for inbound calls (takes priority over campaign)
+
         public static readonly HashSet<string> ValidVoices = new(StringComparer.OrdinalIgnoreCase)
         {
             "alloy", "echo", "fable", "onyx", "nova", "shimmer"

@@ -381,12 +381,14 @@ namespace ContactCenterPOC.Services
             string? campaignId, string? contactName)
         {
             // Resolve prompt
-            string effectivePrompt;
+            string effectivePrompt = _configuration["AzureOpenAI:SystemPrompt"]
+                ?? "You are an AI assistant that helps people find information.";
             string? resolvedCampaignId = null;
             string? resolvedCampaignTitle = null;
 
             if (!string.IsNullOrWhiteSpace(campaignId))
             {
+                // Explicit campaignId from FreeSWITCH dialplan — use that campaign
                 var campaign = await _campaignService.GetByIdAsync(campaignId);
                 if (campaign != null)
                 {
@@ -402,8 +404,47 @@ namespace ContactCenterPOC.Services
             }
             else
             {
-                effectivePrompt = _configuration["AzureOpenAI:SystemPrompt"]
-                    ?? "You are an AI assistant that helps people find information.";
+                // No campaignId from dialplan — use inbound settings from OperatorSettings
+                var inboundResolved = false;
+                if (_settingsService != null)
+                {
+                    try
+                    {
+                        var settings = await _settingsService.GetSettingsAsync();
+
+                        // Priority 1: Custom inbound prompt
+                        if (!string.IsNullOrWhiteSpace(settings.InboundCustomPrompt))
+                        {
+                            effectivePrompt = settings.InboundCustomPrompt;
+                            resolvedCampaignTitle = "Inbound (Custom)";
+                            inboundResolved = true;
+                            _logger.LogInformation("[{CallId}] Using custom inbound prompt", callId);
+                        }
+                        // Priority 2: Mapped inbound campaign
+                        else if (!string.IsNullOrWhiteSpace(settings.InboundCampaignId))
+                        {
+                            var inboundCampaign = await _campaignService.GetByIdAsync(settings.InboundCampaignId);
+                            if (inboundCampaign != null)
+                            {
+                                effectivePrompt = inboundCampaign.AiBehaviorInstructions;
+                                resolvedCampaignId = inboundCampaign.Id;
+                                resolvedCampaignTitle = inboundCampaign.Title;
+                                inboundResolved = true;
+                                _logger.LogInformation("[{CallId}] Using inbound campaign: {CampaignTitle}", callId, inboundCampaign.Title);
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "[{CallId}] Failed to load inbound settings, falling back to system prompt", callId);
+                    }
+                }
+
+                if (!inboundResolved)
+                {
+                    effectivePrompt = _configuration["AzureOpenAI:SystemPrompt"]
+                        ?? "You are an AI assistant that helps people find information.";
+                }
             }
 
             if (!string.IsNullOrWhiteSpace(contactName))
@@ -411,7 +452,7 @@ namespace ContactCenterPOC.Services
                 effectivePrompt = $"IMPORTANT: The person you are talking to is named {contactName}. Greet them by name. " + effectivePrompt;
             }
 
-            // Freeze voice settings from current SettingsService state
+            // Freeze voice settings from current SettingsService state (single read, cached)
             var frozenVoiceApiMode = "ChatGPT";
             var frozenVoiceLiveModel = "gpt-4o";
             var frozenVoiceLiveVoice = "en-US-Ava:DragonHDLatestNeural";
@@ -420,11 +461,11 @@ namespace ContactCenterPOC.Services
             {
                 try
                 {
-                    var settings = await _settingsService.GetSettingsAsync();
-                    maxCallMinutes = settings.MaxCallTimeMinutes;
-                    frozenVoiceApiMode = settings.VoiceApiMode;
-                    frozenVoiceLiveModel = settings.VoiceLiveModel;
-                    frozenVoiceLiveVoice = settings.SelectedVoiceLiveVoice;
+                    var s = await _settingsService.GetSettingsAsync();
+                    maxCallMinutes = s.MaxCallTimeMinutes;
+                    frozenVoiceApiMode = s.VoiceApiMode;
+                    frozenVoiceLiveModel = s.VoiceLiveModel;
+                    frozenVoiceLiveVoice = s.SelectedVoiceLiveVoice;
                 }
                 catch (Exception ex)
                 {

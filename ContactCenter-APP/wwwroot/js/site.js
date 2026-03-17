@@ -1936,7 +1936,23 @@
     };
 
     function loadSettings() {
-        fetch(apiBaseUrl() + "/api/Settings")
+        // Load campaigns for inbound dropdown first, then load settings
+        fetch(apiBaseUrl() + "/api/Campaign")
+            .then(function (resp) { return resp.json(); })
+            .then(function (campaigns) {
+                // Populate inbound campaign dropdown
+                var inboundSelect = document.getElementById("settingsInboundCampaign");
+                if (inboundSelect) {
+                    inboundSelect.innerHTML = '<option value="">-- No script (system default) --</option>';
+                    (campaigns || []).forEach(function (c) {
+                        var opt = document.createElement("option");
+                        opt.value = c.id;
+                        opt.textContent = c.title;
+                        inboundSelect.appendChild(opt);
+                    });
+                }
+                return fetch(apiBaseUrl() + "/api/Settings");
+            })
             .then(function (resp) { return resp.json(); })
             .then(function (settings) {
                 var maxCallInput = document.getElementById("settingsMaxCallTime");
@@ -1995,11 +2011,69 @@
 
                 // Toggle VoiceLive-specific sections
                 updateVoiceLiveSections(settings.voiceApiMode);
+
+                // ═══ INBOUND SCRIPT SETTINGS ═══
+                var inboundRadios = document.querySelectorAll('input[name="inboundScriptMode"]');
+                var inboundCampaignGroup = document.getElementById("inboundCampaignGroup");
+                var inboundCustomPromptGroup = document.getElementById("inboundCustomPromptGroup");
+                var inboundCampaignSelect = document.getElementById("settingsInboundCampaign");
+                var inboundCustomPromptEl = document.getElementById("settingsInboundCustomPrompt");
+
+                if (settings.inboundCustomPrompt) {
+                    // Custom prompt mode
+                    inboundRadios.forEach(function (r) { r.checked = (r.value === "custom"); });
+                    if (inboundCampaignGroup) inboundCampaignGroup.classList.add("d-none");
+                    if (inboundCustomPromptGroup) inboundCustomPromptGroup.classList.remove("d-none");
+                    if (inboundCustomPromptEl) inboundCustomPromptEl.value = settings.inboundCustomPrompt;
+                    updateInboundRadioStyles("custom");
+                } else {
+                    // Campaign mode (default)
+                    inboundRadios.forEach(function (r) { r.checked = (r.value === "campaign"); });
+                    if (inboundCampaignGroup) inboundCampaignGroup.classList.remove("d-none");
+                    if (inboundCustomPromptGroup) inboundCustomPromptGroup.classList.add("d-none");
+                    if (inboundCampaignSelect && settings.inboundCampaignId) {
+                        inboundCampaignSelect.value = settings.inboundCampaignId;
+                    }
+                    if (inboundCustomPromptEl) inboundCustomPromptEl.value = "";
+                    updateInboundRadioStyles("campaign");
+                }
             })
             .catch(function (err) {
                 console.error("Failed to load settings:", err);
             });
     }
+
+    // Helper to update inbound radio visual styles
+    function updateInboundRadioStyles(activeValue) {
+        var radios = document.querySelectorAll('input[name="inboundScriptMode"]');
+        radios.forEach(function (r) {
+            var label = r.closest(".settings-radio-option");
+            if (label) {
+                if (r.value === activeValue) {
+                    label.classList.add("active");
+                } else {
+                    label.classList.remove("active");
+                }
+            }
+        });
+    }
+
+    // Inbound script mode radio change handler
+    document.addEventListener("change", function (e) {
+        if (e.target && e.target.name === "inboundScriptMode") {
+            var mode = e.target.value;
+            var campaignGroup = document.getElementById("inboundCampaignGroup");
+            var customGroup = document.getElementById("inboundCustomPromptGroup");
+            if (mode === "custom") {
+                if (campaignGroup) campaignGroup.classList.add("d-none");
+                if (customGroup) customGroup.classList.remove("d-none");
+            } else {
+                if (campaignGroup) campaignGroup.classList.remove("d-none");
+                if (customGroup) customGroup.classList.add("d-none");
+            }
+            updateInboundRadioStyles(mode);
+        }
+    });
 
     function updateVoiceLiveSections(mode) {
         var modelGroup = document.getElementById("voiceLiveModelGroup");
@@ -2095,13 +2169,31 @@
         var transcriptionSelect = document.getElementById("transcriptionSource");
         var mode = voiceRadio ? voiceRadio.value : "ChatGPT";
 
+        // Inbound script settings
+        var inboundMode = document.querySelector('input[name="inboundScriptMode"]:checked');
+        var inboundModeValue = inboundMode ? inboundMode.value : "campaign";
+        var inboundCampaignSelect = document.getElementById("settingsInboundCampaign");
+        var inboundCustomPromptEl = document.getElementById("settingsInboundCustomPrompt");
+
+        var inboundCampaignId = null;
+        var inboundCustomPrompt = null;
+        if (inboundModeValue === "custom") {
+            inboundCustomPrompt = inboundCustomPromptEl ? inboundCustomPromptEl.value.trim() : null;
+            inboundCampaignId = null;
+        } else {
+            inboundCampaignId = inboundCampaignSelect ? (inboundCampaignSelect.value || null) : null;
+            inboundCustomPrompt = null;
+        }
+
         var payload = {
             maxCallTimeMinutes: parseFloat(maxCallInput.value) || 2,
             voiceApiMode: mode,
             selectedVoice: mode === "ChatGPT" ? (voiceSelect ? voiceSelect.value : "alloy") : undefined,
             voiceLiveModel: mode === "VoiceLive" ? (modelSelect ? modelSelect.value : "gpt-4o") : undefined,
             selectedVoiceLiveVoice: mode === "VoiceLive" ? (voiceSelect ? voiceSelect.value : undefined) : undefined,
-            transcriptionMode: mode === "VoiceLive" ? (transcriptionSelect ? transcriptionSelect.value : "BuiltIn") : undefined
+            transcriptionMode: mode === "VoiceLive" ? (transcriptionSelect ? transcriptionSelect.value : "BuiltIn") : undefined,
+            inboundCampaignId: inboundCampaignId,
+            inboundCustomPrompt: inboundCustomPrompt
         };
 
         var saveBtn = document.getElementById("saveSettingsBtn");
