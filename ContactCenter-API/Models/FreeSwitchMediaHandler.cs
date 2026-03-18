@@ -359,21 +359,24 @@ namespace ContactCenterPOC.Models
                         if (_aiGenerating)
                         {
                             _log.Info("Playback queue empty but AI still generating, waiting...");
-                            // Wait up to 5s for either: new item enqueued, or AI finished
-                            var waitResult = await Task.WhenAny(
-                                Task.Run(() => _aiFinishedSignal.Wait(_cts.Token)),
-                                WaitForQueueItemAsync(5000));
+                            bool gotItem = false;
+                            // Keep waiting as long as AI is still generating
+                            while (_aiGenerating && !_cts.IsCancellationRequested)
+                            {
+                                await Task.WhenAny(
+                                    Task.Run(() => _aiFinishedSignal.Wait(_cts.Token)),
+                                    WaitForQueueItemAsync(5000));
 
-                            // Re-check queue after waking up
-                            if (_playbackQueue.TryDequeue(out item))
-                            {
-                                // Got a new item, continue playing
+                                if (_playbackQueue.TryDequeue(out item))
+                                {
+                                    gotItem = true;
+                                    break;
+                                }
+                                if (!_aiGenerating)
+                                    break; // AI finished, no more items coming
+                                // Timeout but AI still generating — keep waiting
                             }
-                            else
-                            {
-                                // AI finished or timeout — exit the loop
-                                break;
-                            }
+                            if (!gotItem) break;
                         }
                         else
                         {

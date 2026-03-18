@@ -314,9 +314,11 @@ namespace ContactCenterPOC.Services
                     {
                         _log.Info("Model turn generation finished. Status: {Status}. Total audio chunks sent: {ChunkCount}", 
                             turnFinishedUpdate.Status, audioChunkCount);
-                        m_mediaStreaming.NotifyAiResponseFinished();
-                        // Signal the media handler to flush buffered audio (plays via ESL for FreeSWITCH)
+                        // Flush remaining buffered audio BEFORE signaling finished,
+                        // otherwise ProcessPlaybackQueue wakes up, sees empty queue + !_aiGenerating,
+                        // and unmutes mic before the last segment is enqueued.
                         await m_mediaStreaming.FlushAudioAsync();
+                        m_mediaStreaming.NotifyAiResponseFinished();
                     }
 
                     if (update is ConversationErrorUpdate errorUpdate)

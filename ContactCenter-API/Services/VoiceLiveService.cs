@@ -251,8 +251,10 @@ namespace ContactCenterPOC.Services
                     {
                         _log.Info("Response turn finished. Total audio chunks: {ChunkCount}",
                             audioChunkCount);
-                        m_mediaStreaming.NotifyAiResponseFinished();
+                        // Flush remaining buffered audio BEFORE signaling finished,
+                        // to avoid race where ProcessPlaybackQueue unmutes before last segment.
                         await m_mediaStreaming.FlushAudioAsync();
+                        m_mediaStreaming.NotifyAiResponseFinished();
                     }
 
                     // Error handling
