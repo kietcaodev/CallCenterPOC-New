@@ -223,6 +223,14 @@ namespace ContactCenterPOC.Services
                     if (update is SessionUpdateConversationItemInputAudioTranscriptionCompleted userTranscript)
                     {
                         _log.Info("User audio transcript: {Transcript}", userTranscript.Transcript);
+
+                        // Filter out Whisper hallucinations (YouTube outro phrases etc.)
+                        if (WhisperHallucinationFilter.IsHallucination(userTranscript.Transcript))
+                        {
+                            _log.Info("Filtered hallucinated transcript: {Transcript}", userTranscript.Transcript);
+                            continue;
+                        }
+
                         var recipientEntry = new TranscriptEntry
                         {
                             CallConnectionId = _callConnectionId,

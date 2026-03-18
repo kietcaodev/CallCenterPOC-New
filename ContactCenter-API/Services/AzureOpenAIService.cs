@@ -287,6 +287,14 @@ namespace ContactCenterPOC.Services
                     if (update is ConversationInputTranscriptionFinishedUpdate transcriptionCompletedUpdate)
                     {
                         _log.Info("User audio transcript: {Transcript}", transcriptionCompletedUpdate.Transcript);
+
+                        // Filter out Whisper hallucinations (YouTube outro phrases etc.)
+                        if (WhisperHallucinationFilter.IsHallucination(transcriptionCompletedUpdate.Transcript))
+                        {
+                            _log.Info("Filtered hallucinated transcript: {Transcript}", transcriptionCompletedUpdate.Transcript);
+                            continue;
+                        }
+
                         var recipientEntry = new TranscriptEntry
                         {
                             CallConnectionId = _callConnectionId,

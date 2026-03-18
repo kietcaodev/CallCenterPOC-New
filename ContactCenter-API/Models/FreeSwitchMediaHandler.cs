@@ -38,12 +38,6 @@ namespace ContactCenterPOC.Models
         private const int FreeSwitchSampleRate = 16000;
         private const int OpenAiSampleRate = 24000;
 
-        // Pre-allocated silence frame at 24kHz PCM16 mono (20ms = 960 bytes).
-        // Sent to OpenAI ONLY while uuid_broadcast is actively playing on the channel,
-        // to prevent telephone echo (speaker→mic coupling) from feeding into Whisper.
-        // Between playback segments and after playback: real audio goes straight through.
-        private static readonly byte[] SilenceFrame24k = new byte[960];
-
         // Auto-flush threshold: flush buffer during generation every ~2 seconds of audio
         // to minimize silence gaps when AI generates slower than real-time
         // while keeping segments large enough to avoid choppy ESL playback.
@@ -68,12 +62,6 @@ namespace ContactCenterPOC.Models
         // Playback queue: ensures turns play sequentially without overlapping
         private readonly ConcurrentQueue<(string filePath, int pcmBytes)> _playbackQueue = new();
         private int _playbackRunning; // 0 = idle, 1 = running
-
-        // True ONLY while uuid_broadcast is actively playing a WAV file (from broadcast
-        // command to PLAYBACK_STOP event). False between segments and after playback.
-        // Used to gate silence substitution — prevents echo during playback while
-        // allowing real audio through at all other times for proper STT.
-        private volatile bool _isPlayingBack;
 
         // When set, the next AI audio chunk triggers an immediate flush regardless of threshold.
         // Set when playback queue empties so the next audio segment plays without delay.
@@ -204,7 +192,6 @@ namespace ContactCenterPOC.Models
                         return;
                     }
 
-                    _isPlayingBack = false;
                     _audioBuffer.SetLength(0);
                     _eagerAccumulateStart = DateTime.MinValue;
                     _flushOnNextChunk = false;
@@ -322,7 +309,6 @@ namespace ContactCenterPOC.Models
             {
                 while (_playbackQueue.TryDequeue(out var item))
                 {
-                    _isPlayingBack = true;
                     await EslBroadcastAsync(item.filePath);
                     // Wait for FreeSWITCH PLAYBACK_STOP event instead of estimating duration.
                     // Fallback timeout = estimated duration + 400ms safety margin.
@@ -340,7 +326,6 @@ namespace ContactCenterPOC.Models
                             _log.Info("Playback wait cancelled by barge-in");
                         }
                     }
-                    _isPlayingBack = false;
                 }
 
                 // Signal SendMessageAsync to flush immediately on the next audio chunk.
@@ -351,7 +336,6 @@ namespace ContactCenterPOC.Models
             catch (OperationCanceledException) { }
             finally
             {
-                _isPlayingBack = false;
                 Interlocked.Exchange(ref _playbackRunning, 0);
                 // Re-check in case items were enqueued while we were finishing
                 if (!_playbackQueue.IsEmpty && Interlocked.CompareExchange(ref _playbackRunning, 1, 0) == 0)
@@ -471,7 +455,6 @@ namespace ContactCenterPOC.Models
                 var messageBuffer = new MemoryStream();
                 int messageCount = 0;
                 int forwardedCount = 0;
-                int silenceCount = 0;
 
                 while (_webSocket.State == WebSocketState.Open)
                 {
@@ -494,29 +477,17 @@ namespace ContactCenterPOC.Models
                             var audioData = messageBuffer.ToArray();
                             messageBuffer.SetLength(0);
 
-                            // During active ESL playback: send silence to prevent
-                            // telephone echo (bot's speaker → phone mic → READ stream)
-                            // from reaching OpenAI and causing Whisper hallucinations.
-                            // Between segments and after playback: real audio goes through
-                            // immediately for proper user speech transcription.
-                            if (_isPlayingBack)
-                            {
-                                silenceCount++;
-                                using var silenceMs = new MemoryStream(SilenceFrame24k);
-                                if (_vlServiceHandler != null)
-                                    await _vlServiceHandler.SendAudioToExternalAI(silenceMs);
-                                else if (_aiServiceHandler != null)
-                                    await _aiServiceHandler.SendAudioToExternalAI(silenceMs);
-                                continue;
-                            }
-
-                            // Resample 16kHz → 24kHz and forward real mic audio to OpenAI
+                            // Always forward real mic audio to OpenAI — full-duplex mode.
+                            // User can speak while bot is playing. OpenAI server-side VAD
+                            // handles barge-in detection. Echo from telephone speaker→mic
+                            // coupling may cause Whisper hallucinations, which are filtered
+                            // at the transcript level (see WhisperHallucinationFilter).
                             var resampled = AudioResampler.Upsample16kTo24k(audioData);
                             forwardedCount++;
                             if (forwardedCount == 1 || forwardedCount % 250 == 0)
                             {
-                                _log.Info("Audio stats: forwarded={Forwarded}, silence={Silence}",
-                                    forwardedCount, silenceCount);
+                                _log.Info("Audio stats: forwarded={Forwarded}",
+                                    forwardedCount);
                             }
 
                             using var ms = new MemoryStream(resampled);
@@ -539,8 +510,8 @@ namespace ContactCenterPOC.Models
                     }
                 }
 
-                _log.Info("FreeSWITCH receive loop ended. Total messages: {Count}, forwarded: {Forwarded}, silence: {Silence}",
-                    messageCount, forwardedCount, silenceCount);
+                _log.Info("FreeSWITCH receive loop ended. Total messages: {Count}, forwarded: {Forwarded}",
+                    messageCount, forwardedCount);
             }
             catch (OperationCanceledException)
             {
