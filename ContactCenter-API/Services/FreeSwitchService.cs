@@ -20,6 +20,12 @@ namespace ContactCenterPOC.Services
         private const int MaxReconnectAttempts = 5;
         private const int ReconnectDelayMs = 5000;
         private bool _isDisposed;
+        private Timer? _keepaliveTimer;
+        private volatile bool _eventConnAlive;
+        private IDisposable? _eventSubscription1;
+        private IDisposable? _eventSubscription2;
+        private IDisposable? _eventSubscription3;
+        private IDisposable? _eventSubscription4;
 
         // Events for call lifecycle
         public event Action<string>? CallAnswered;       // uuid
@@ -57,6 +63,8 @@ namespace ContactCenterPOC.Services
                     EventName.ChannelExecuteComplete);
 
                 SetupEventHandlers();
+                _eventConnAlive = true;
+                StartKeepalive();
                 _logger.LogInformation("FreeSWITCH event connection established");
                 _reconnectAttempts = 0;
             }
@@ -71,77 +79,173 @@ namespace ContactCenterPOC.Services
         {
             if (_eventConn == null) return;
 
-            _eventConn.Events.Where(x => x.EventName == EventName.ChannelAnswer)
-                .Subscribe(evt =>
-                {
-                    var uuid = evt.Headers.ContainsKey("Unique-ID") ? evt.Headers["Unique-ID"] : "";
-                    if (!string.IsNullOrEmpty(uuid))
-                    {
-                        _logger.LogInformation("[{UUID}] ESL event: call answered", uuid);
-                        CallAnswered?.Invoke(uuid);
-                    }
-                });
+            // Dispose previous subscriptions on reconnect
+            _eventSubscription1?.Dispose();
+            _eventSubscription2?.Dispose();
+            _eventSubscription3?.Dispose();
+            _eventSubscription4?.Dispose();
 
-            _eventConn.Events.Where(x => x.EventName == EventName.ChannelHangupComplete)
-                .Subscribe(evt =>
-                {
-                    var uuid = evt.Headers.ContainsKey("Unique-ID") ? evt.Headers["Unique-ID"] : "";
-                    var cause = evt.Headers.ContainsKey("Hangup-Cause") ? evt.Headers["Hangup-Cause"] : "unknown";
-                    if (!string.IsNullOrEmpty(uuid))
+            _eventSubscription1 = _eventConn.Events.Where(x => x.EventName == EventName.ChannelAnswer)
+                .Subscribe(
+                    evt =>
                     {
-                        _logger.LogInformation("[{UUID}] Call hangup, cause: {Cause}", uuid, cause);
-                        // Clean up any pending playback waiter
-                        if (_playbackWaiters.TryRemove(uuid, out var entry))
-                            entry.tcs.TrySetCanceled();
-                        if (cause == "ORIGINATOR_CANCEL" || cause == "NO_ANSWER" || cause == "USER_BUSY" ||
-                            cause == "NO_ROUTE_DESTINATION" || cause == "CALL_REJECTED")
+                        var uuid = evt.Headers.ContainsKey("Unique-ID") ? evt.Headers["Unique-ID"] : "";
+                        if (!string.IsNullOrEmpty(uuid))
                         {
-                            CallFailed?.Invoke(uuid);
+                            _logger.LogInformation("[{UUID}] ESL event: call answered", uuid);
+                            CallAnswered?.Invoke(uuid);
                         }
-                        else
-                        {
-                            CallHangup?.Invoke(uuid, cause);
-                        }
-                    }
-                });
+                    },
+                    ex => OnEventConnectionLost("ChannelAnswer error", ex),
+                    () => OnEventConnectionLost("ChannelAnswer completed", null));
 
-            _eventConn.Events.Where(x => x.EventName == EventName.PlaybackStop)
-                .Subscribe(evt =>
-                {
-                    var uuid = evt.Headers.ContainsKey("Unique-ID") ? evt.Headers["Unique-ID"] : "";
-                    if (!string.IsNullOrEmpty(uuid))
+            _eventSubscription2 = _eventConn.Events.Where(x => x.EventName == EventName.ChannelHangupComplete)
+                .Subscribe(
+                    evt =>
                     {
-                        var filePath = evt.Headers.ContainsKey("Playback-File-Path") ? evt.Headers["Playback-File-Path"] : "";
-                        _logger.LogInformation("[{UUID}] PLAYBACK_STOP, file={File}", uuid, filePath);
-                        if (_playbackWaiters.TryGetValue(uuid, out var entry) &&
-                            string.Equals(entry.filePath, filePath, StringComparison.Ordinal))
+                        var uuid = evt.Headers.ContainsKey("Unique-ID") ? evt.Headers["Unique-ID"] : "";
+                        var cause = evt.Headers.ContainsKey("Hangup-Cause") ? evt.Headers["Hangup-Cause"] : "unknown";
+                        if (!string.IsNullOrEmpty(uuid))
                         {
-                            if (_playbackWaiters.TryRemove(uuid, out _))
-                                entry.tcs.TrySetResult(true);
+                            _logger.LogInformation("[{UUID}] Call hangup, cause: {Cause}", uuid, cause);
+                            if (_playbackWaiters.TryRemove(uuid, out var entry))
+                                entry.tcs.TrySetCanceled();
+                            if (cause == "ORIGINATOR_CANCEL" || cause == "NO_ANSWER" || cause == "USER_BUSY" ||
+                                cause == "NO_ROUTE_DESTINATION" || cause == "CALL_REJECTED")
+                            {
+                                CallFailed?.Invoke(uuid);
+                            }
+                            else
+                            {
+                                CallHangup?.Invoke(uuid, cause);
+                            }
                         }
-                    }
-                });
+                    },
+                    ex => OnEventConnectionLost("ChannelHangup error", ex),
+                    () => OnEventConnectionLost("ChannelHangup completed", null));
 
-            // Backup handler: uuid_broadcast may fire CHANNEL_EXECUTE_COMPLETE (Application=playback)
-            // instead of (or in addition to) PLAYBACK_STOP depending on FreeSWITCH version.
-            _eventConn.Events.Where(x => x.EventName == EventName.ChannelExecuteComplete)
-                .Subscribe(evt =>
-                {
-                    var app = evt.Headers.ContainsKey("Application") ? evt.Headers["Application"] : "";
-                    if (app != "playback") return;
-                    var uuid = evt.Headers.ContainsKey("Unique-ID") ? evt.Headers["Unique-ID"] : "";
-                    if (!string.IsNullOrEmpty(uuid))
+            _eventSubscription3 = _eventConn.Events.Where(x => x.EventName == EventName.PlaybackStop)
+                .Subscribe(
+                    evt =>
                     {
-                        var filePath = evt.Headers.ContainsKey("Application-Data") ? evt.Headers["Application-Data"] : "";
-                        _logger.LogInformation("[{UUID}] EXECUTE_COMPLETE (playback), file={File}", uuid, filePath);
-                        if (_playbackWaiters.TryGetValue(uuid, out var entry) &&
-                            string.Equals(entry.filePath, filePath, StringComparison.Ordinal))
+                        var uuid = evt.Headers.ContainsKey("Unique-ID") ? evt.Headers["Unique-ID"] : "";
+                        if (!string.IsNullOrEmpty(uuid))
                         {
-                            if (_playbackWaiters.TryRemove(uuid, out _))
-                                entry.tcs.TrySetResult(true);
+                            var filePath = evt.Headers.ContainsKey("Playback-File-Path") ? evt.Headers["Playback-File-Path"] : "";
+                            _logger.LogInformation("[{UUID}] PLAYBACK_STOP, file={File}", uuid, filePath);
+                            if (_playbackWaiters.TryGetValue(uuid, out var entry) &&
+                                string.Equals(entry.filePath, filePath, StringComparison.Ordinal))
+                            {
+                                if (_playbackWaiters.TryRemove(uuid, out _))
+                                    entry.tcs.TrySetResult(true);
+                            }
                         }
-                    }
-                });
+                    },
+                    ex => OnEventConnectionLost("PlaybackStop error", ex),
+                    () => OnEventConnectionLost("PlaybackStop completed", null));
+
+            _eventSubscription4 = _eventConn.Events.Where(x => x.EventName == EventName.ChannelExecuteComplete)
+                .Subscribe(
+                    evt =>
+                    {
+                        var app = evt.Headers.ContainsKey("Application") ? evt.Headers["Application"] : "";
+                        if (app != "playback") return;
+                        var uuid = evt.Headers.ContainsKey("Unique-ID") ? evt.Headers["Unique-ID"] : "";
+                        if (!string.IsNullOrEmpty(uuid))
+                        {
+                            var filePath = evt.Headers.ContainsKey("Application-Data") ? evt.Headers["Application-Data"] : "";
+                            _logger.LogInformation("[{UUID}] EXECUTE_COMPLETE (playback), file={File}", uuid, filePath);
+                            if (_playbackWaiters.TryGetValue(uuid, out var entry) &&
+                                string.Equals(entry.filePath, filePath, StringComparison.Ordinal))
+                            {
+                                if (_playbackWaiters.TryRemove(uuid, out _))
+                                    entry.tcs.TrySetResult(true);
+                            }
+                        }
+                    },
+                    ex => OnEventConnectionLost("ExecuteComplete error", ex),
+                    () => OnEventConnectionLost("ExecuteComplete completed", null));
+        }
+
+        /// <summary>
+        /// Called when the event Observable errors or completes (connection dropped).
+        /// Triggers automatic reconnection of the event connection.
+        /// </summary>
+        private void OnEventConnectionLost(string reason, Exception? ex)
+        {
+            if (_isDisposed) return;
+            _eventConnAlive = false;
+            if (ex != null)
+                _logger.LogWarning(ex, "ESL event connection lost: {Reason}", reason);
+            else
+                _logger.LogWarning("ESL event connection lost: {Reason}", reason);
+            _ = ReconnectEventConnectionAsync();
+        }
+
+        /// <summary>
+        /// Reconnect only the event connection (command connection may still be alive).
+        /// </summary>
+        private async Task ReconnectEventConnectionAsync()
+        {
+            if (_isDisposed) return;
+
+            if (!await _reconnectLock.WaitAsync(0)) return; // another reconnect in progress
+            try
+            {
+                _logger.LogInformation("Reconnecting ESL event connection...");
+                _keepaliveTimer?.Dispose();
+                _eventConn?.Dispose();
+                _eventConn = null;
+
+                var host = _configuration["FreeSWITCH:Host"] ?? "127.0.0.1";
+                var port = int.Parse(_configuration["FreeSWITCH:Port"] ?? "8021");
+                var password = _configuration["FreeSWITCH:Password"] ?? "ClueCon";
+
+                _eventConn = await InboundSocket.Connect(host, port, password);
+                await _eventConn.SubscribeEvents(
+                    EventName.ChannelAnswer,
+                    EventName.ChannelHangupComplete,
+                    EventName.ChannelState,
+                    EventName.PlaybackStop,
+                    EventName.ChannelExecuteComplete);
+
+                SetupEventHandlers();
+                _eventConnAlive = true;
+                StartKeepalive();
+                _logger.LogInformation("ESL event connection re-established");
+            }
+            catch (Exception reconnectEx)
+            {
+                _logger.LogError(reconnectEx, "Failed to reconnect ESL event connection");
+                // Fall back to full reconnect
+                _ = TryReconnectAsync();
+            }
+            finally
+            {
+                _reconnectLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// Periodically send a lightweight command on the event connection to detect silent TCP drops.
+        /// </summary>
+        private void StartKeepalive()
+        {
+            _keepaliveTimer?.Dispose();
+            _keepaliveTimer = new Timer(async _ =>
+            {
+                if (_isDisposed || _eventConn == null) return;
+                try
+                {
+                    await _eventConn.Api("status");
+                }
+                catch
+                {
+                    _logger.LogWarning("ESL event connection keepalive failed");
+                    _eventConnAlive = false;
+                    _ = ReconnectEventConnectionAsync();
+                }
+            }, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
         }
 
         /// <summary>
@@ -306,6 +410,15 @@ namespace ContactCenterPOC.Services
         /// </summary>
         public async Task WaitForPlaybackStopAsync(string uuid, string filePath, int fallbackMs, CancellationToken ct)
         {
+            // If event connection is dead, trigger reconnect and just use the fallback timer
+            if (!_eventConnAlive)
+            {
+                _logger.LogWarning("[{UUID}] WaitForPlaybackStop: event connection is dead, using duration-based wait ({Ms}ms)", uuid, fallbackMs);
+                _ = ReconnectEventConnectionAsync();
+                await Task.Delay(fallbackMs, ct);
+                return;
+            }
+
             var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             _playbackWaiters[uuid] = (tcs, filePath);
             using var reg = ct.Register(() =>
@@ -362,6 +475,7 @@ namespace ContactCenterPOC.Services
         }
 
         public bool IsConnected => _commandConn != null;
+        public bool IsEventConnAlive => _eventConnAlive;
 
         private async Task TryReconnectAsync()
         {
@@ -385,6 +499,11 @@ namespace ContactCenterPOC.Services
         public void Dispose()
         {
             _isDisposed = true;
+            _keepaliveTimer?.Dispose();
+            _eventSubscription1?.Dispose();
+            _eventSubscription2?.Dispose();
+            _eventSubscription3?.Dispose();
+            _eventSubscription4?.Dispose();
             _commandConn?.Dispose();
             _eventConn?.Dispose();
             _reconnectLock.Dispose();

@@ -157,7 +157,7 @@ namespace ContactCenterPOC.Services
                 {
                     Model = "whisper-1",
                 },
-                TurnDetectionOptions = ConversationTurnDetectionOptions.CreateServerVoiceActivityTurnDetectionOptions(0.5f, TimeSpan.FromMilliseconds(500), TimeSpan.FromMilliseconds(500)),
+                TurnDetectionOptions = ConversationTurnDetectionOptions.CreateServerVoiceActivityTurnDetectionOptions(0.7f, TimeSpan.FromMilliseconds(500), TimeSpan.FromMilliseconds(300)),
             };
 
             await session.ConfigureSessionAsync(sessionOptions);

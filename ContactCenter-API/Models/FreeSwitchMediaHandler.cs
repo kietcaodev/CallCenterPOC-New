@@ -91,6 +91,12 @@ namespace ContactCenterPOC.Models
         // accumulation window. Reset when eager flush fires or flushOnNextChunk is cleared.
         private DateTime _eagerAccumulateStart = DateTime.MinValue;
 
+        // False until the first AI response has been fully played back.
+        // While false, send silence to OpenAI instead of real mic audio.
+        // This prevents phone-line background noise from triggering VAD hallucinations
+        // during the initial AI greeting (the user shouldn't be speaking yet anyway).
+        private volatile bool _firstPlaybackDone;
+
         public FreeSwitchMediaHandler(
             WebSocket webSocket,
             IConfiguration configuration,
@@ -320,8 +326,10 @@ namespace ContactCenterPOC.Models
                     _isPlayingBack = true;
                     await EslBroadcastAsync(item.filePath);
                     // Wait for FreeSWITCH PLAYBACK_STOP event instead of estimating duration.
-                    // Fallback timeout = estimated duration + 2s safety margin in case event is lost.
-                    var fallbackMs = (int)((double)item.pcmBytes / 32000 * 1000) + 2000;
+                    // Fallback timeout = estimated duration + 400ms safety margin.
+                    // Keep this tight: when ESL event connection is stale, this fallback
+                    // IS the playback duration. A 2s pad was causing audible gaps.
+                    var fallbackMs = (int)((double)item.pcmBytes / 32000 * 1000) + 400;
                     _log.Info("Waiting for PLAYBACK_STOP (fallback {Fallback}ms)",
                         fallbackMs);
                     if (_freeSwitchService != null)
@@ -352,6 +360,7 @@ namespace ContactCenterPOC.Models
                 }
                 _isPlayingBack = false;
                 _playbackEndedAt = DateTime.UtcNow;
+                _firstPlaybackDone = true;
 
                 // Signal SendMessageAsync to flush immediately on the next audio chunk.
                 // Without this, after a turn finishes playing, audio sits in the buffer
@@ -507,17 +516,15 @@ namespace ContactCenterPOC.Models
                             var audioData = messageBuffer.ToArray();
                             messageBuffer.SetLength(0);
 
-                            // During AI playback (or the post-playback cooldown), send silence
-                            // to OpenAI instead of real mic audio.
-                            // mod_audio_stream captures uuid_broadcast audio mixed into READ stream;
-                            // sending that would trigger false VAD → phantom transcripts.
-                            // The cooldown period covers residual echo that lingers in the READ
-                            // stream after PLAYBACK_STOP, and gives input_audio_buffer.clear time
-                            // to propagate to the OpenAI server before real audio resumes.
+                            // Send silence to OpenAI instead of real mic audio when:
+                            // 1. AI is currently playing back audio (echo prevention)
+                            // 2. Post-playback cooldown (residual echo in READ stream)
+                            // 3. First AI greeting hasn't finished yet (phone-line noise
+                            //    triggers VAD hallucinations before any real conversation)
                             var inCooldown = !_isPlayingBack
                                 && _playbackEndedAt != DateTime.MinValue
                                 && (DateTime.UtcNow - _playbackEndedAt).TotalMilliseconds < PostPlaybackSilenceMs;
-                            if (_isPlayingBack || inCooldown)
+                            if (_isPlayingBack || inCooldown || !_firstPlaybackDone)
                             {
                                 silenceCount++;
                                 using var silenceMs = new MemoryStream(SilenceFrame24k);
