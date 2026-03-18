@@ -44,14 +44,22 @@ namespace ContactCenterPOC.Models
         // when real mic audio resumes after the gap.
         private static readonly byte[] SilenceFrame24k = new byte[960];
 
-        // Auto-flush threshold: flush buffer during generation every ~1.5 seconds of audio
-        // to minimize silence gaps when AI generates slower than real-time.
-        // (PCM 16kHz mono 16-bit = 32000 bytes/sec, so 48000 = 1.5s)
-        private const int AutoFlushThresholdBytes = 48000;
+        // Auto-flush threshold: flush buffer during generation every ~2 seconds of audio
+        // to minimize silence gaps when AI generates slower than real-time
+        // while keeping segments large enough to avoid choppy ESL playback.
+        // (PCM 16kHz mono 16-bit = 32000 bytes/sec, so 64000 = 2s)
+        private const int AutoFlushThresholdBytes = 64000;
 
-        // Minimum buffer size for an immediate flush (0.25s = 8000 bytes).
+        // Minimum buffer size for an eager flush (1s = 32000 bytes).
         // Prevents micro-segments that would cause choppy playback via ESL.
-        private const int MinImmediateFlushBytes = 8000;
+        // Each uuid_broadcast has ~50-100ms overhead; sub-second files make this
+        // overhead a significant fraction of the segment duration.
+        private const int MinImmediateFlushBytes = 32000;
+
+        // Accumulation window (ms) for eager flush. When playback queue empties and
+        // _flushOnNextChunk is set, we wait this long before flushing to let more
+        // audio accumulate. This converts 7+ micro-segments into 2-3 larger ones.
+        private const int EagerAccumulationMs = 300;
 
         // Buffer to accumulate audio chunks per AI turn, then play via ESL
         private readonly MemoryStream _audioBuffer = new();
@@ -71,6 +79,17 @@ namespace ContactCenterPOC.Models
         // Timestamp of last FlushAudioAsync — used to ignore stale VAD events
         // (OpenAI delivers SpeechStarted AFTER ResponseFinished for already-processed speech)
         private DateTime _lastFlushAt = DateTime.MinValue;
+
+        // Timestamp when playback ended — used to extend silence period after playback.
+        // mod_audio_stream may still carry residual echo from uuid_broadcast in the READ
+        // stream for a short period after PLAYBACK_STOP. Without this grace period,
+        // that echo feeds OpenAI VAD → phantom transcripts.
+        private DateTime _playbackEndedAt = DateTime.MinValue;
+        private const int PostPlaybackSilenceMs = 800;
+
+        // Timestamp when _flushOnNextChunk first saw eligible audio — used for
+        // accumulation window. Reset when eager flush fires or flushOnNextChunk is cleared.
+        private DateTime _eagerAccumulateStart = DateTime.MinValue;
 
         public FreeSwitchMediaHandler(
             WebSocket webSocket,
@@ -191,6 +210,8 @@ namespace ContactCenterPOC.Models
 
                     _isPlayingBack = false;
                     _audioBuffer.SetLength(0);
+                    _eagerAccumulateStart = DateTime.MinValue;
+                    _flushOnNextChunk = false;
                     // Clear any queued turns and stop current playback
                     while (_playbackQueue.TryDequeue(out _)) { }
                     // BreakAudioAsync also cancels the pending WaitForPlaybackStopAsync waiter
@@ -212,13 +233,27 @@ namespace ContactCenterPOC.Models
                     // Auto-flush when buffer exceeds threshold for low-latency playback.
                     // Without this, long AI responses are fully buffered before any audio plays,
                     // causing 30+ seconds of silence until ResponseFinished.
-                    // Also flush immediately when _flushOnNextChunk is set (queue just emptied)
-                    // to minimize the silence gap between playback segments.
+                    //
+                    // Eager-flush path: when playback queue emptied (_flushOnNextChunk),
+                    // a 300ms accumulation window lets more audio collect before flushing.
+                    // This converts many small (<0.5s) WAV files into fewer large (1-2s)
+                    // segments, dramatically reducing ESL uuid_broadcast overhead and
+                    // eliminating audible gaps between segments.
                     var shouldFlush = _audioBuffer.Length >= AutoFlushThresholdBytes;
                     if (!shouldFlush && _flushOnNextChunk && _audioBuffer.Length >= MinImmediateFlushBytes)
                     {
-                        shouldFlush = true;
-                        _flushOnNextChunk = false;
+                        // Start the accumulation window on first eligible chunk
+                        if (_eagerAccumulateStart == DateTime.MinValue)
+                        {
+                            _eagerAccumulateStart = DateTime.UtcNow;
+                        }
+                        // Flush only after the accumulation window expires
+                        if ((DateTime.UtcNow - _eagerAccumulateStart).TotalMilliseconds >= EagerAccumulationMs)
+                        {
+                            shouldFlush = true;
+                            _flushOnNextChunk = false;
+                            _eagerAccumulateStart = DateTime.MinValue;
+                        }
                     }
                     if (shouldFlush)
                     {
@@ -300,30 +335,29 @@ namespace ContactCenterPOC.Models
                             _log.Info("Playback wait cancelled by barge-in");
                         }
                     }
+
+                    // Clear input buffer between turns to flush accumulated echo.
+                    // mod_audio_stream mixes uuid_broadcast into the READ stream;
+                    // even with silence-mute, residual echo may have leaked through
+                    // the ~1ms transition window. Clearing here ensures each gap
+                    // between turns starts with a clean slate.
+                    try
+                    {
+                        if (_aiServiceHandler != null)
+                            await _aiServiceHandler.ClearInputAudioBufferAsync();
+                        else if (_vlServiceHandler != null)
+                            await _vlServiceHandler.ClearInputAudioBufferAsync();
+                    }
+                    catch { /* best effort */ }
                 }
                 _isPlayingBack = false;
+                _playbackEndedAt = DateTime.UtcNow;
 
                 // Signal SendMessageAsync to flush immediately on the next audio chunk.
                 // Without this, after a turn finishes playing, audio sits in the buffer
                 // until it reaches AutoFlushThresholdBytes — causing silence gaps when
                 // the AI generates audio slower than real-time.
                 _flushOnNextChunk = true;
-
-                // Clear OpenAI's input audio buffer after playback ends.
-                // Accumulated silence/echo during mute can leave server-side VAD in a
-                // state where it won't detect the onset of real speech.
-                try
-                {
-                    if (_aiServiceHandler != null)
-                        await _aiServiceHandler.ClearInputAudioBufferAsync();
-                    else if (_vlServiceHandler != null)
-                        await _vlServiceHandler.ClearInputAudioBufferAsync();
-                    _log.Info("Input audio buffer cleared, ready for user speech");
-                }
-                catch (Exception ex)
-                {
-                    _log.Warn(ex, "Failed to clear input audio buffer");
-                }
 
                 _log.Info("Playback queue empty, upstream unmuted");
             }
@@ -473,13 +507,18 @@ namespace ContactCenterPOC.Models
                             var audioData = messageBuffer.ToArray();
                             messageBuffer.SetLength(0);
 
-                            if (_isPlayingBack)
+                            // During AI playback (or the post-playback cooldown), send silence
+                            // to OpenAI instead of real mic audio.
+                            // mod_audio_stream captures uuid_broadcast audio mixed into READ stream;
+                            // sending that would trigger false VAD → phantom transcripts.
+                            // The cooldown period covers residual echo that lingers in the READ
+                            // stream after PLAYBACK_STOP, and gives input_audio_buffer.clear time
+                            // to propagate to the OpenAI server before real audio resumes.
+                            var inCooldown = !_isPlayingBack
+                                && _playbackEndedAt != DateTime.MinValue
+                                && (DateTime.UtcNow - _playbackEndedAt).TotalMilliseconds < PostPlaybackSilenceMs;
+                            if (_isPlayingBack || inCooldown)
                             {
-                                // During AI playback, send silence to OpenAI instead of mic audio.
-                                // mod_audio_stream captures uuid_broadcast audio mixed into READ stream;
-                                // sending that would trigger false VAD → model self-interrupts.
-                                // Sending silence (instead of nothing) keeps the audio stream continuous
-                                // so server-side VAD properly detects speech when playback ends.
                                 silenceCount++;
                                 using var silenceMs = new MemoryStream(SilenceFrame24k);
                                 if (_vlServiceHandler != null)
