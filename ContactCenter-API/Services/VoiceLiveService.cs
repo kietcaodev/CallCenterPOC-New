@@ -171,6 +171,10 @@ namespace ContactCenterPOC.Services
                         if (audioDelta.Delta != null)
                         {
                             audioChunkCount++;
+                            if (audioChunkCount == 1)
+                            {
+                                m_mediaStreaming.NotifyAiResponseStarted();
+                            }
                             if (audioChunkCount <= 3 || audioChunkCount % 50 == 0)
                             {
                                 _log.Info("Sending audio chunk #{ChunkNum} to ACS",
@@ -247,6 +251,8 @@ namespace ContactCenterPOC.Services
                     {
                         _log.Info("Response turn finished. Total audio chunks: {ChunkCount}",
                             audioChunkCount);
+                        m_mediaStreaming.NotifyAiResponseFinished();
+                        await m_mediaStreaming.FlushAudioAsync();
                     }
 
                     // Error handling

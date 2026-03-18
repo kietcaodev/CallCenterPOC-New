@@ -227,6 +227,7 @@ namespace ContactCenterPOC.Services
                     if (update is ConversationItemStreamingStartedUpdate itemStartedUpdate)
                     {
                         _log.Info("Begin streaming of new item");
+                        m_mediaStreaming.NotifyAiResponseStarted();
                     }
 
                     // Audio transcript updates contain the incremental text matching the generated
@@ -313,6 +314,7 @@ namespace ContactCenterPOC.Services
                     {
                         _log.Info("Model turn generation finished. Status: {Status}. Total audio chunks sent: {ChunkCount}", 
                             turnFinishedUpdate.Status, audioChunkCount);
+                        m_mediaStreaming.NotifyAiResponseFinished();
                         // Signal the media handler to flush buffered audio (plays via ESL for FreeSWITCH)
                         await m_mediaStreaming.FlushAudioAsync();
                     }

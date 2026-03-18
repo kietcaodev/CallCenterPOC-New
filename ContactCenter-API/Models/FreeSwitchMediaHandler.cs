@@ -91,11 +91,17 @@ namespace ContactCenterPOC.Models
         // accumulation window. Reset when eager flush fires or flushOnNextChunk is cleared.
         private DateTime _eagerAccumulateStart = DateTime.MinValue;
 
-        // False until the first AI response has been fully played back.
-        // While false, send silence to OpenAI instead of real mic audio.
-        // This prevents phone-line background noise from triggering VAD hallucinations
-        // during the initial AI greeting (the user shouldn't be speaking yet anyway).
-        private volatile bool _firstPlaybackDone;
+        // True while the AI model is actively generating a response (between 
+        // ConversationItemStreamingStarted and ConversationResponseFinished).
+        // During this period, upstream mic must stay muted even between auto-flush 
+        // playback segments. Without this, AI response gets split into multiple turns
+        // by auto-flush, the queue empties between turns, mic unmutes, and phone-line
+        // noise/echo feeds into OpenAI causing VAD hallucinations mid-greeting.
+        private volatile bool _aiGenerating;
+
+        // Signaled when _aiGenerating transitions to false, so ProcessPlaybackQueueAsync
+        // can stop waiting for more audio and unmute.
+        private readonly ManualResetEventSlim _aiFinishedSignal = new(false);
 
         public FreeSwitchMediaHandler(
             WebSocket webSocket,
@@ -215,6 +221,8 @@ namespace ContactCenterPOC.Models
                     }
 
                     _isPlayingBack = false;
+                    _aiGenerating = false;
+                    _aiFinishedSignal.Set();
                     _audioBuffer.SetLength(0);
                     _eagerAccumulateStart = DateTime.MinValue;
                     _flushOnNextChunk = false;
@@ -274,6 +282,26 @@ namespace ContactCenterPOC.Models
         }
 
         /// <summary>
+        /// Called by AI service when model starts generating a response.
+        /// Prevents mic audio from reaching OpenAI until response is fully generated and played.
+        /// </summary>
+        public void NotifyAiResponseStarted()
+        {
+            _aiGenerating = true;
+            _aiFinishedSignal.Reset();
+        }
+
+        /// <summary>
+        /// Called by AI service when model finishes generating a response.
+        /// Allows ProcessPlaybackQueueAsync to unmute after remaining audio plays.
+        /// </summary>
+        public void NotifyAiResponseFinished()
+        {
+            _aiGenerating = false;
+            _aiFinishedSignal.Set();
+        }
+
+        /// <summary>
         /// Write buffered audio to a WAV file and enqueue for sequential playback via ESL.
         /// </summary>
         public async Task FlushAudioAsync()
@@ -316,19 +344,47 @@ namespace ContactCenterPOC.Models
         /// Process queued audio files sequentially: play one, wait for PLAYBACK_STOP event, then play next.
         /// Mutes upstream mic audio during playback to prevent echo from mod_audio_stream
         /// feeding uuid_broadcast audio back to OpenAI (which would trigger false VAD → incomplete responses).
+        /// When the queue empties but AI is still generating, waits for more items instead of unmuting.
         /// </summary>
         private async Task ProcessPlaybackQueueAsync()
         {
             try
             {
-                while (_playbackQueue.TryDequeue(out var item))
+                while (true)
                 {
+                    // Try to dequeue the next item
+                    if (!_playbackQueue.TryDequeue(out var item))
+                    {
+                        // Queue is empty. If AI is still generating, wait for more items.
+                        if (_aiGenerating)
+                        {
+                            _log.Info("Playback queue empty but AI still generating, waiting...");
+                            // Wait up to 5s for either: new item enqueued, or AI finished
+                            var waitResult = await Task.WhenAny(
+                                Task.Run(() => _aiFinishedSignal.Wait(_cts.Token)),
+                                WaitForQueueItemAsync(5000));
+
+                            // Re-check queue after waking up
+                            if (_playbackQueue.TryDequeue(out item))
+                            {
+                                // Got a new item, continue playing
+                            }
+                            else
+                            {
+                                // AI finished or timeout — exit the loop
+                                break;
+                            }
+                        }
+                        else
+                        {
+                            break; // Queue empty and AI done
+                        }
+                    }
+
                     _isPlayingBack = true;
                     await EslBroadcastAsync(item.filePath);
                     // Wait for FreeSWITCH PLAYBACK_STOP event instead of estimating duration.
                     // Fallback timeout = estimated duration + 400ms safety margin.
-                    // Keep this tight: when ESL event connection is stale, this fallback
-                    // IS the playback duration. A 2s pad was causing audible gaps.
                     var fallbackMs = (int)((double)item.pcmBytes / 32000 * 1000) + 400;
                     _log.Info("Waiting for PLAYBACK_STOP (fallback {Fallback}ms)",
                         fallbackMs);
@@ -345,10 +401,6 @@ namespace ContactCenterPOC.Models
                     }
 
                     // Clear input buffer between turns to flush accumulated echo.
-                    // mod_audio_stream mixes uuid_broadcast into the READ stream;
-                    // even with silence-mute, residual echo may have leaked through
-                    // the ~1ms transition window. Clearing here ensures each gap
-                    // between turns starts with a clean slate.
                     try
                     {
                         if (_aiServiceHandler != null)
@@ -360,12 +412,8 @@ namespace ContactCenterPOC.Models
                 }
                 _isPlayingBack = false;
                 _playbackEndedAt = DateTime.UtcNow;
-                _firstPlaybackDone = true;
 
                 // Signal SendMessageAsync to flush immediately on the next audio chunk.
-                // Without this, after a turn finishes playing, audio sits in the buffer
-                // until it reaches AutoFlushThresholdBytes — causing silence gaps when
-                // the AI generates audio slower than real-time.
                 _flushOnNextChunk = true;
 
                 _log.Info("Playback queue empty, upstream unmuted");
@@ -380,6 +428,19 @@ namespace ContactCenterPOC.Models
                 {
                     _ = Task.Run(ProcessPlaybackQueueAsync);
                 }
+            }
+        }
+
+        /// <summary>
+        /// Wait until the playback queue has at least one item, up to a timeout.
+        /// Used when AI is still generating and we expect more audio segments.
+        /// </summary>
+        private async Task WaitForQueueItemAsync(int timeoutMs)
+        {
+            var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+            while (_playbackQueue.IsEmpty && DateTime.UtcNow < deadline && !_cts.IsCancellationRequested)
+            {
+                await Task.Delay(50, _cts.Token);
             }
         }
 
@@ -519,12 +580,14 @@ namespace ContactCenterPOC.Models
                             // Send silence to OpenAI instead of real mic audio when:
                             // 1. AI is currently playing back audio (echo prevention)
                             // 2. Post-playback cooldown (residual echo in READ stream)
-                            // 3. First AI greeting hasn't finished yet (phone-line noise
-                            //    triggers VAD hallucinations before any real conversation)
+                            // 3. AI is still generating a response (_aiGenerating) — even if
+                            //    the playback queue is temporarily empty between auto-flush
+                            //    segments. Without this, phone-line noise leaks into OpenAI
+                            //    during the inter-segment gap and causes VAD hallucinations.
                             var inCooldown = !_isPlayingBack
                                 && _playbackEndedAt != DateTime.MinValue
                                 && (DateTime.UtcNow - _playbackEndedAt).TotalMilliseconds < PostPlaybackSilenceMs;
-                            if (_isPlayingBack || inCooldown || !_firstPlaybackDone)
+                            if (_isPlayingBack || inCooldown || _aiGenerating)
                             {
                                 silenceCount++;
                                 using var silenceMs = new MemoryStream(SilenceFrame24k);
