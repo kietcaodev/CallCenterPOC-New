@@ -1978,6 +1978,20 @@
                     if (notConfiguredBadge) notConfiguredBadge.classList.add("d-none");
                 }
 
+                // GeminiLive configuration status
+                var glOption = document.getElementById("geminiLiveOption");
+                var glRadio = document.querySelector('input[name="voiceApiMode"][value="GeminiLive"]');
+                var glNotConfiguredBadge = document.getElementById("geminiLiveNotConfiguredBadge");
+                if (settings.geminiLiveConfigured === false) {
+                    if (glRadio) glRadio.disabled = true;
+                    if (glOption) glOption.classList.add("disabled-option");
+                    if (glNotConfiguredBadge) glNotConfiguredBadge.classList.remove("d-none");
+                } else {
+                    if (glRadio) glRadio.disabled = false;
+                    if (glOption) glOption.classList.remove("disabled-option");
+                    if (glNotConfiguredBadge) glNotConfiguredBadge.classList.add("d-none");
+                }
+
                 // OpenAI voice dropdown
                 var voiceSelect = document.getElementById("settingsVoice");
                 if (voiceSelect && settings.selectedVoice) {
@@ -2001,7 +2015,23 @@
 
                 // Cache available voices for mode switching
                 window._vlAvailableVoices = settings.availableVoiceLiveVoices || [];
+                window._glAvailableVoices = settings.availableGeminiVoices || [];
                 window._vlSettings = settings;
+
+                // GeminiLive voice dropdown
+                var geminiVoiceSelect = document.getElementById("settingsGeminiLiveVoice");
+                if (geminiVoiceSelect && settings.availableGeminiVoices) {
+                    geminiVoiceSelect.innerHTML = "";
+                    settings.availableGeminiVoices.forEach(function (v) {
+                        var opt = document.createElement("option");
+                        opt.value = v;
+                        opt.textContent = v;
+                        geminiVoiceSelect.appendChild(opt);
+                    });
+                    if (settings.geminiLiveVoice) {
+                        geminiVoiceSelect.value = settings.geminiLiveVoice;
+                    }
+                }
 
                 // Transcription source
                 var transcriptionSelect = document.getElementById("transcriptionSource");
@@ -2078,16 +2108,29 @@
     function updateVoiceLiveSections(mode) {
         var modelGroup = document.getElementById("voiceLiveModelGroup");
         var transcriptionGroup = document.getElementById("transcriptionSourceGroup");
+        var geminiVoiceGroup = document.getElementById("geminiLiveVoiceGroup");
         var voiceSelect = document.getElementById("settingsVoice");
         var voiceGroup = voiceSelect ? voiceSelect.closest(".settings-group") : null;
         var voiceLabel = voiceGroup ? voiceGroup.querySelector(".settings-label") : null;
         var voiceDesc = voiceGroup ? voiceGroup.querySelector(".settings-description") : null;
 
-        if (mode === "VoiceLive") {
+        if (mode === "GeminiLive") {
+            // Hide VoiceLive-specific groups
+            if (modelGroup) modelGroup.classList.add("d-none");
+            if (transcriptionGroup) transcriptionGroup.classList.add("d-none");
+            // Show Gemini voice dropdown
+            if (geminiVoiceGroup) geminiVoiceGroup.classList.remove("d-none");
+            // Hide main voice dropdown (Gemini has its own)
+            if (voiceGroup) voiceGroup.classList.add("d-none");
+        } else if (mode === "VoiceLive") {
             // Show VoiceLive model dropdown
             if (modelGroup) modelGroup.classList.remove("d-none");
             // Show transcription source
             if (transcriptionGroup) transcriptionGroup.classList.remove("d-none");
+            // Hide Gemini voice dropdown
+            if (geminiVoiceGroup) geminiVoiceGroup.classList.add("d-none");
+            // Show main voice dropdown
+            if (voiceGroup) voiceGroup.classList.remove("d-none");
 
             // Update voice label and description for VoiceLive
             if (voiceLabel) voiceLabel.textContent = "Dragon HD Voice";
@@ -2132,6 +2175,10 @@
             if (modelGroup) modelGroup.classList.add("d-none");
             // Hide transcription source
             if (transcriptionGroup) transcriptionGroup.classList.add("d-none");
+            // Hide Gemini voice dropdown
+            if (geminiVoiceGroup) geminiVoiceGroup.classList.add("d-none");
+            // Show main voice dropdown
+            if (voiceGroup) voiceGroup.classList.remove("d-none");
 
             // Restore voice label and description for ChatGPT
             if (voiceLabel) voiceLabel.textContent = "AI Voice";
@@ -2167,6 +2214,7 @@
         var voiceSelect = document.getElementById("settingsVoice");
         var modelSelect = document.getElementById("settingsVoiceLiveModel");
         var transcriptionSelect = document.getElementById("transcriptionSource");
+        var geminiVoiceSelect = document.getElementById("settingsGeminiLiveVoice");
         var mode = voiceRadio ? voiceRadio.value : "ChatGPT";
 
         // Inbound script settings
@@ -2192,6 +2240,8 @@
             voiceLiveModel: mode === "VoiceLive" ? (modelSelect ? modelSelect.value : "gpt-4o") : undefined,
             selectedVoiceLiveVoice: mode === "VoiceLive" ? (voiceSelect ? voiceSelect.value : undefined) : undefined,
             transcriptionMode: mode === "VoiceLive" ? (transcriptionSelect ? transcriptionSelect.value : "BuiltIn") : undefined,
+            geminiLiveModel: mode === "GeminiLive" ? (window._vlSettings && window._vlSettings.geminiLiveModel ? window._vlSettings.geminiLiveModel : "gemini-2.5-flash-native-audio-preview-12-2025") : undefined,
+            geminiLiveVoice: mode === "GeminiLive" ? (geminiVoiceSelect ? geminiVoiceSelect.value : "Puck") : undefined,
             inboundCampaignId: inboundCampaignId,
             inboundCustomPrompt: inboundCustomPrompt
         };

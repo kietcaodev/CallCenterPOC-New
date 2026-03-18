@@ -18,6 +18,7 @@ namespace ContactCenterPOC.Models
         private CancellationTokenSource _cts;
         private AzureOpenAIService? _aiServiceHandler;
         private VoiceLiveService? _vlServiceHandler;
+        private GeminiLiveService? _geminiServiceHandler;
         private readonly IConfiguration _configuration;
         private readonly ILogger<CallService> _logger;
         private readonly CallLogger _log;
@@ -32,6 +33,8 @@ namespace ContactCenterPOC.Models
         private readonly string? _voiceLiveModel;
         private readonly string? _selectedVoiceLiveVoice;
         private readonly VoiceLiveConfig? _voiceLiveConfig;
+        private readonly GeminiLiveConfig? _geminiLiveConfig;
+        private readonly string? _geminiLiveVoice;
         private readonly FreeSwitchService? _freeSwitchService;
 
         // Audio format: FreeSWITCH sends 16kHz, OpenAI expects 24kHz
@@ -90,6 +93,8 @@ namespace ContactCenterPOC.Models
             string? voiceLiveModel = null,
             string? selectedVoiceLiveVoice = null,
             VoiceLiveConfig? voiceLiveConfig = null,
+            GeminiLiveConfig? geminiLiveConfig = null,
+            string? geminiLiveVoice = null,
             FreeSwitchService? freeSwitchService = null)
         {
             _webSocket = webSocket;
@@ -108,6 +113,8 @@ namespace ContactCenterPOC.Models
             _voiceLiveModel = voiceLiveModel;
             _selectedVoiceLiveVoice = selectedVoiceLiveVoice;
             _voiceLiveConfig = voiceLiveConfig;
+            _geminiLiveConfig = geminiLiveConfig;
+            _geminiLiveVoice = geminiLiveVoice;
             _freeSwitchService = freeSwitchService;
         }
 
@@ -138,6 +145,31 @@ namespace ContactCenterPOC.Models
                 finally
                 {
                     _vlServiceHandler.Close();
+                    Close();
+                    await InvokeHangUpCallback();
+                }
+            }
+            else if (_voiceApiMode == "GeminiLive" && _geminiLiveConfig != null && _geminiLiveConfig.IsConfigured)
+            {
+                _log.Info("Dispatching to GeminiLiveService (voice={Voice})",
+                    _geminiLiveVoice);
+                _geminiServiceHandler = new GeminiLiveService(
+                    this, callContextPrompt, _geminiLiveConfig, _logger, _hubContext,
+                    _callConnectionId, _geminiLiveVoice,
+                    _hangUpCallback, _sentimentService, _activeCalls, _emotionService);
+
+                try
+                {
+                    _geminiServiceHandler.StartConversation();
+                    await ReceiveFromFreeSwitchAsync();
+                }
+                catch (Exception ex)
+                {
+                    _log.Error(ex, "GeminiLive WebSocket error");
+                }
+                finally
+                {
+                    _geminiServiceHandler.Close();
                     Close();
                     await InvokeHangUpCallback();
                 }
@@ -494,6 +526,10 @@ namespace ContactCenterPOC.Models
                             if (_vlServiceHandler != null)
                             {
                                 await _vlServiceHandler.SendAudioToExternalAI(ms);
+                            }
+                            else if (_geminiServiceHandler != null)
+                            {
+                                await _geminiServiceHandler.SendAudioToExternalAI(ms);
                             }
                             else if (_aiServiceHandler != null)
                             {

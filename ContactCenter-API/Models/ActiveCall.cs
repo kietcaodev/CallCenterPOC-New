@@ -30,5 +30,9 @@ namespace ContactCenterPOC.Models
         public string? VoiceLiveModel { get; set; }
         public string? VoiceLiveVoice { get; set; }
         public int ReconnectAttempts { get; set; } = 0;
+
+        // GeminiLive-specific fields (frozen at call start)
+        public string? GeminiLiveModel { get; set; }
+        public string? GeminiLiveVoice { get; set; }
     }
 }

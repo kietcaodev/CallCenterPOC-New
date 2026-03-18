@@ -23,6 +23,7 @@ namespace ContactCenterPOC.Services
         private readonly CallSummaryService? _callSummaryService;
         private readonly SettingsService? _settingsService;
         private readonly VoiceLiveConfig _voiceLiveConfig;
+        private readonly GeminiLiveConfig _geminiLiveConfig;
 
         // Thread-safe dictionaries for concurrent call handling
         private readonly ConcurrentDictionary<string, ActiveCall> _activeCalls = new();
@@ -30,7 +31,7 @@ namespace ContactCenterPOC.Services
 
         public ConcurrentDictionary<string, ActiveCall> ActiveCalls => _activeCalls;
 
-        public CallService(IConfiguration configuration, ILogger<CallService> logger, IHubContext<TranscriptHub> hubContext, CampaignService campaignService, CallHistoryService callHistoryService, VoiceLiveConfig voiceLiveConfig, FreeSwitchService freeSwitchService, SentimentAnalysisService? sentimentService = null, EmotionAnalysisService? emotionService = null, OperatorStyleAnalysisService? operatorStyleService = null, CallSummaryService? callSummaryService = null, SettingsService? settingsService = null)
+        public CallService(IConfiguration configuration, ILogger<CallService> logger, IHubContext<TranscriptHub> hubContext, CampaignService campaignService, CallHistoryService callHistoryService, VoiceLiveConfig voiceLiveConfig, GeminiLiveConfig geminiLiveConfig, FreeSwitchService freeSwitchService, SentimentAnalysisService? sentimentService = null, EmotionAnalysisService? emotionService = null, OperatorStyleAnalysisService? operatorStyleService = null, CallSummaryService? callSummaryService = null, SettingsService? settingsService = null)
         {
             _logger = logger;
             _configuration = configuration;
@@ -43,6 +44,7 @@ namespace ContactCenterPOC.Services
             _callSummaryService = callSummaryService;
             _settingsService = settingsService;
             _voiceLiveConfig = voiceLiveConfig;
+            _geminiLiveConfig = geminiLiveConfig;
             _freeSwitchService = freeSwitchService;
             _callbackUri = configuration["CallbackUrl"] ?? throw new InvalidOperationException("CallbackUrl not configured");
 
@@ -206,6 +208,8 @@ namespace ContactCenterPOC.Services
                 var frozenVoiceLiveModel = "gpt-4o";
                 var frozenVoiceLiveVoice = "en-US-Ava:DragonHDLatestNeural";
                 var frozenSelectedVoice = "alloy";
+                var frozenGeminiLiveModel = "gemini-2.5-flash-native-audio-preview-12-2025";
+                var frozenGeminiLiveVoice = "Puck";
                 if (_settingsService != null)
                 {
                     try
@@ -216,6 +220,8 @@ namespace ContactCenterPOC.Services
                         frozenVoiceLiveModel = settings.VoiceLiveModel;
                         frozenVoiceLiveVoice = settings.SelectedVoiceLiveVoice;
                         frozenSelectedVoice = settings.SelectedVoice;
+                        frozenGeminiLiveModel = settings.GeminiLiveModel;
+                        frozenGeminiLiveVoice = settings.GeminiLiveVoice;
                     }
                     catch (Exception ex)
                     {
@@ -227,12 +233,24 @@ namespace ContactCenterPOC.Services
                 activeCall.VoiceApiMode = frozenVoiceApiMode;
                 activeCall.VoiceLiveModel = frozenVoiceApiMode == "VoiceLive" ? frozenVoiceLiveModel : null;
                 activeCall.VoiceLiveVoice = frozenVoiceApiMode == "VoiceLive" ? frozenVoiceLiveVoice : null;
+                activeCall.GeminiLiveModel = frozenVoiceApiMode == "GeminiLive" ? frozenGeminiLiveModel : null;
+                activeCall.GeminiLiveVoice = frozenVoiceApiMode == "GeminiLive" ? frozenGeminiLiveVoice : null;
 
                 // FR-015: Log engine type, voice, and model when call starts
+                string logVoice = frozenVoiceApiMode switch
+                {
+                    "VoiceLive" => frozenVoiceLiveVoice,
+                    "GeminiLive" => frozenGeminiLiveVoice,
+                    _ => frozenSelectedVoice
+                };
+                string logModel = frozenVoiceApiMode switch
+                {
+                    "VoiceLive" => frozenVoiceLiveModel,
+                    "GeminiLive" => frozenGeminiLiveModel,
+                    _ => "N/A"
+                };
                 _logger.LogInformation("[{CallConnectionId}] Call initiated: engine={Engine}, voice={Voice}, model={Model}",
-                    callConnectionId, frozenVoiceApiMode,
-                    frozenVoiceApiMode == "VoiceLive" ? frozenVoiceLiveVoice : frozenSelectedVoice,
-                    frozenVoiceApiMode == "VoiceLive" ? frozenVoiceLiveModel : "N/A");
+                    callConnectionId, frozenVoiceApiMode, logVoice, logModel);
                 activeCall.CancellationTokenSource.CancelAfter(TimeSpan.FromMinutes(maxCallMinutes));
                 activeCall.CancellationTokenSource.Token.Register(async () =>
                 {
@@ -312,11 +330,26 @@ namespace ContactCenterPOC.Services
                 return;
             }
 
+            // Check GeminiLive configuration before proceeding
+            if (activeCall.VoiceApiMode == "GeminiLive" && !_geminiLiveConfig.IsConfigured)
+            {
+                log.Warn("GeminiLive call attempted but API key not configured");
+                await _hubContext.Clients.Group(callConnectionId)
+                    .SendAsync("CallStatusChanged", new
+                    {
+                        callConnectionId = callConnectionId,
+                        status = "Failed",
+                        message = "GeminiLive is not configured. Please set a Gemini API key."
+                    });
+                return;
+            }
+
             // Read voice settings
             var selectedVoice = "alloy";
             var voiceApiMode = activeCall.VoiceApiMode;
             var voiceLiveModel = activeCall.VoiceLiveModel ?? "gpt-4o";
             var voiceLiveVoice = activeCall.VoiceLiveVoice ?? "en-US-Ava:DragonHDLatestNeural";
+            var geminiLiveVoice = activeCall.GeminiLiveVoice ?? "Puck";
             if (_settingsService != null)
             {
                 try
@@ -349,6 +382,7 @@ namespace ContactCenterPOC.Services
                 callConnectionId, null,
                 _sentimentService, _activeCalls, _emotionService, selectedVoice,
                 voiceApiMode, voiceLiveModel, voiceLiveVoice, _voiceLiveConfig,
+                _geminiLiveConfig, geminiLiveVoice,
                 _freeSwitchService);
             _mediaHandlers[callConnectionId] = handler;
 
@@ -456,6 +490,8 @@ namespace ContactCenterPOC.Services
             var frozenVoiceApiMode = "ChatGPT";
             var frozenVoiceLiveModel = "gpt-4o";
             var frozenVoiceLiveVoice = "en-US-Ava:DragonHDLatestNeural";
+            var frozenGeminiLiveModel = "gemini-2.5-flash-native-audio-preview-12-2025";
+            var frozenGeminiLiveVoice = "Puck";
             var maxCallMinutes = 2.0;
             if (_settingsService != null)
             {
@@ -466,6 +502,8 @@ namespace ContactCenterPOC.Services
                     frozenVoiceApiMode = s.VoiceApiMode;
                     frozenVoiceLiveModel = s.VoiceLiveModel;
                     frozenVoiceLiveVoice = s.SelectedVoiceLiveVoice;
+                    frozenGeminiLiveModel = s.GeminiLiveModel;
+                    frozenGeminiLiveVoice = s.GeminiLiveVoice;
                 }
                 catch (Exception ex)
                 {
@@ -487,7 +525,9 @@ namespace ContactCenterPOC.Services
                 StartedAt = DateTimeOffset.UtcNow,
                 VoiceApiMode = frozenVoiceApiMode,
                 VoiceLiveModel = frozenVoiceApiMode == "VoiceLive" ? frozenVoiceLiveModel : null,
-                VoiceLiveVoice = frozenVoiceApiMode == "VoiceLive" ? frozenVoiceLiveVoice : null
+                VoiceLiveVoice = frozenVoiceApiMode == "VoiceLive" ? frozenVoiceLiveVoice : null,
+                GeminiLiveModel = frozenVoiceApiMode == "GeminiLive" ? frozenGeminiLiveModel : null,
+                GeminiLiveVoice = frozenVoiceApiMode == "GeminiLive" ? frozenGeminiLiveVoice : null
             };
 
             // Auto-terminate timer

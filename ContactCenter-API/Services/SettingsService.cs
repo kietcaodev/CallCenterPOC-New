@@ -76,7 +76,7 @@ namespace ContactCenterPOC.Services
                 if (settings.MaxCallTimeMinutes > 30)
                     settings.MaxCallTimeMinutes = 30;
 
-                if (settings.VoiceApiMode != "ChatGPT" && settings.VoiceApiMode != "VoiceLive")
+                if (settings.VoiceApiMode != "ChatGPT" && settings.VoiceApiMode != "VoiceLive" && settings.VoiceApiMode != "GeminiLive")
                     settings.VoiceApiMode = "ChatGPT";
 
                 if (!OperatorSettings.ValidVoices.Contains(settings.SelectedVoice))
@@ -100,6 +100,16 @@ namespace ContactCenterPOC.Services
                     if (!OperatorSettings.ValidTranscriptionModes.Contains(settings.TranscriptionMode))
                     {
                         settings.TranscriptionMode = "BuiltIn";
+                    }
+                }
+
+                // GeminiLive-specific validation (mode-conditional)
+                if (settings.VoiceApiMode == "GeminiLive")
+                {
+                    if (!OperatorSettings.ValidGeminiVoices.Contains(settings.GeminiLiveVoice))
+                    {
+                        _logger.LogWarning("Unknown GeminiLive voice '{Voice}', defaulting to 'Puck'", settings.GeminiLiveVoice);
+                        settings.GeminiLiveVoice = "Puck";
                     }
                 }
 

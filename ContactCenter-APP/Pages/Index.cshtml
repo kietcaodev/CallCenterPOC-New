@@ -35,12 +35,23 @@
                         <span class="radio-label">Voice Live</span>
                         <span class="radio-badge not-configured-badge d-none" id="voiceLiveNotConfiguredBadge">Not Configured</span>
                     </label>
+                    <label class="settings-radio-option" id="geminiLiveOption">
+                        <input type="radio" name="voiceApiMode" value="GeminiLive">
+                        <span class="radio-label">Gemini Live</span>
+                        <span class="radio-badge not-configured-badge d-none" id="geminiLiveNotConfiguredBadge">Not Configured</span>
+                    </label>
                 </div>
             </div>
             <div class="settings-group d-none" id="voiceLiveModelGroup">
                 <label class="settings-label" for="settingsVoiceLiveModel">AI Model</label>
                 <p class="settings-description">Select the AI model used for VoiceLive calls.</p>
                 <select class="form-control form-control-sm settings-input" id="settingsVoiceLiveModel">
+                </select>
+            </div>
+            <div class="settings-group d-none" id="geminiLiveVoiceGroup">
+                <label class="settings-label" for="settingsGeminiLiveVoice">Gemini Voice</label>
+                <p class="settings-description">Choose the voice used by Gemini Live during calls.</p>
+                <select class="form-control form-control-sm settings-input" id="settingsGeminiLiveVoice">
                 </select>
             </div>
             <div class="settings-group">

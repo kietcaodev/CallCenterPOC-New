@@ -10,11 +10,13 @@ namespace ContactCenterPOC.Controllers
     {
         private readonly SettingsService _settingsService;
         private readonly VoiceLiveConfig _voiceLiveConfig;
+        private readonly GeminiLiveConfig _geminiLiveConfig;
 
-        public SettingsController(SettingsService settingsService, VoiceLiveConfig voiceLiveConfig)
+        public SettingsController(SettingsService settingsService, VoiceLiveConfig voiceLiveConfig, GeminiLiveConfig geminiLiveConfig)
         {
             _settingsService = settingsService;
             _voiceLiveConfig = voiceLiveConfig;
+            _geminiLiveConfig = geminiLiveConfig;
         }
 
         [HttpGet]
@@ -31,9 +33,13 @@ namespace ContactCenterPOC.Controllers
                 settings.SelectedVoiceLiveVoice,
                 settings.InboundCampaignId,
                 settings.InboundCustomPrompt,
+                settings.GeminiLiveModel,
+                settings.GeminiLiveVoice,
                 VoiceLiveConfigured = _voiceLiveConfig.IsConfigured,
                 AvailableVoiceLiveVoices = VoiceLiveVoices.All,
-                AvailableVoiceLiveModels = OperatorSettings.ValidVoiceLiveModels.ToList()
+                AvailableVoiceLiveModels = OperatorSettings.ValidVoiceLiveModels.ToList(),
+                GeminiLiveConfigured = _geminiLiveConfig.IsConfigured,
+                AvailableGeminiVoices = OperatorSettings.ValidGeminiVoices.ToList()
             };
             return Ok(response);
         }
@@ -57,9 +63,13 @@ namespace ContactCenterPOC.Controllers
                 saved.SelectedVoiceLiveVoice,
                 saved.InboundCampaignId,
                 saved.InboundCustomPrompt,
+                saved.GeminiLiveModel,
+                saved.GeminiLiveVoice,
                 VoiceLiveConfigured = _voiceLiveConfig.IsConfigured,
                 AvailableVoiceLiveVoices = VoiceLiveVoices.All,
-                AvailableVoiceLiveModels = OperatorSettings.ValidVoiceLiveModels.ToList()
+                AvailableVoiceLiveModels = OperatorSettings.ValidVoiceLiveModels.ToList(),
+                GeminiLiveConfigured = _geminiLiveConfig.IsConfigured,
+                AvailableGeminiVoices = OperatorSettings.ValidGeminiVoices.ToList()
             };
             return Ok(response);
         }

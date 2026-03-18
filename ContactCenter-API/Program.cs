@@ -17,6 +17,10 @@ builder.Logging.AddFileLogger(logDir);
 builder.Services.Configure<VoiceLiveConfig>(builder.Configuration.GetSection("VoiceLive"));
 builder.Services.AddSingleton(sp => sp.GetRequiredService<IOptions<VoiceLiveConfig>>().Value);
 
+// Bind GeminiLive configuration
+builder.Services.Configure<GeminiLiveConfig>(builder.Configuration.GetSection("GeminiLive"));
+builder.Services.AddSingleton(sp => sp.GetRequiredService<IOptions<GeminiLiveConfig>>().Value);
+
 // Register FreeSWITCH service (replaces ACS CallAutomationClient)
 builder.Services.AddSingleton<FreeSwitchService>();
 
