@@ -74,7 +74,7 @@ namespace ContactCenterPOC.Services
             _webSocket = new ClientWebSocket();
             var uri = new Uri($"{GeminiWssBaseUrl}?key={_config.ApiKey}");
 
-            _log.Info("Connecting to Gemini Live API...");
+            _log.Info("Connecting to Gemini Live API (model={Model})...", _config.Model);
             await _webSocket.ConnectAsync(uri, _cts.Token);
             _log.Info("WebSocket connected to Gemini");
 
@@ -189,7 +189,8 @@ namespace ContactCenterPOC.Services
 
                     if (result.MessageType == WebSocketMessageType.Close)
                     {
-                        _log.Info("Gemini WebSocket closed by server");
+                        _log.Info("Gemini WebSocket closed by server: status={Status}, description={Desc}",
+                            result.CloseStatus, result.CloseStatusDescription);
                         break;
                     }
 
