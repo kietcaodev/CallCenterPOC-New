@@ -133,11 +133,20 @@ namespace ContactCenterPOC.Services
                         {
                             var filePath = evt.Headers.ContainsKey("Playback-File-Path") ? evt.Headers["Playback-File-Path"] : "";
                             _logger.LogInformation("[{UUID}] PLAYBACK_STOP, file={File}", uuid, filePath);
-                            if (_playbackWaiters.TryGetValue(uuid, out var entry) &&
-                                string.Equals(entry.filePath, filePath, StringComparison.Ordinal))
+                            if (_playbackWaiters.TryGetValue(uuid, out var entry))
                             {
-                                if (_playbackWaiters.TryRemove(uuid, out _))
-                                    entry.tcs.TrySetResult(true);
+                                var match = string.Equals(entry.filePath, filePath, StringComparison.Ordinal);
+                                _logger.LogInformation("[{UUID}] PLAYBACK_STOP waiter found: expected={Expected}, got={Got}, match={Match}",
+                                    uuid, entry.filePath, filePath, match);
+                                if (match)
+                                {
+                                    if (_playbackWaiters.TryRemove(uuid, out _))
+                                        entry.tcs.TrySetResult(true);
+                                }
+                            }
+                            else
+                            {
+                                _logger.LogWarning("[{UUID}] PLAYBACK_STOP: no waiter registered for this UUID", uuid);
                             }
                         }
                     },
@@ -419,6 +428,9 @@ namespace ContactCenterPOC.Services
                 return;
             }
 
+            _logger.LogInformation("[{UUID}] WaitForPlaybackStop: waiting for file={File}, fallback={Ms}ms",
+                uuid, Path.GetFileName(filePath), fallbackMs);
+
             var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             _playbackWaiters[uuid] = (tcs, filePath);
             using var reg = ct.Register(() =>
@@ -432,8 +444,14 @@ namespace ContactCenterPOC.Services
                 var winner = await Task.WhenAny(tcs.Task, Task.Delay(fallbackMs, ct));
                 if (winner != tcs.Task)
                 {
-                    _logger.LogWarning("[{UUID}] WaitForPlaybackStop: fallback timeout {Ms}ms elapsed", uuid, fallbackMs);
+                    _logger.LogWarning("[{UUID}] WaitForPlaybackStop: fallback timeout {Ms}ms elapsed, file={File}",
+                        uuid, fallbackMs, Path.GetFileName(filePath));
                     _playbackWaiters.TryRemove(uuid, out _);
+                }
+                else
+                {
+                    _logger.LogInformation("[{UUID}] WaitForPlaybackStop: PLAYBACK_STOP received for {File}",
+                        uuid, Path.GetFileName(filePath));
                 }
             }
             catch (OperationCanceledException) { }

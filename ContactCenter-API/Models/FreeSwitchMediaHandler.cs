@@ -57,6 +57,14 @@ namespace ContactCenterPOC.Models
         // Immediate flush if buffer exceeds ~1 second of 16kHz PCM16 mono
         private const int MaxBufferBytes = 32000;
 
+        // --- Debug timing ---
+        private DateTime _firstChunkTime = DateTime.MinValue;
+        private DateTime _lastChunkTime = DateTime.MinValue;
+        private int _totalChunksReceived = 0;
+        private int _totalBytesBuffered = 0;
+        private int _queuedSegments = 0;
+        private int _playedSegments = 0;
+
         public FreeSwitchMediaHandler(
             WebSocket webSocket,
             IConfiguration configuration,
@@ -204,16 +212,30 @@ namespace ContactCenterPOC.Models
                 var audioBytes = ExtractAudioFromAcsJson(acsJsonMessage);
                 if (audioBytes != null && audioBytes.Length > 0)
                 {
+                    var now = DateTime.UtcNow;
+                    _totalChunksReceived++;
+                    if (_firstChunkTime == DateTime.MinValue) _firstChunkTime = now;
+                    var sinceLastChunk = _lastChunkTime == DateTime.MinValue ? 0 : (now - _lastChunkTime).TotalMilliseconds;
+                    _lastChunkTime = now;
+
                     // Resample 24kHz → 16kHz for FreeSWITCH
                     var resampled = AudioResampler.Downsample24kTo16k(audioBytes);
+                    var resampledMs = resampled.Length / 32.0; // 16kHz * 2 bytes = 32 bytes/ms
+
+                    _log.Info("[PIPE] Chunk #{Num}: {OrigBytes}B@24k → {ResBytes}B@16k ({AudioMs:F0}ms audio), gap={Gap:F0}ms, queued={Queued}, played={Played}",
+                        _totalChunksReceived, audioBytes.Length, resampled.Length, resampledMs,
+                        sinceLastChunk, _queuedSegments - _playedSegments, _playedSegments);
 
                     lock (_bufferLock)
                     {
                         _audioBuffer.Write(resampled, 0, resampled.Length);
+                        _totalBytesBuffered += resampled.Length;
 
                         // Immediate flush for large buffers (>1s of audio)
                         if (_audioBuffer.Length >= MaxBufferBytes)
                         {
+                            _log.Info("[PIPE] Flushing buffer (max threshold): {BufLen}B ({BufMs:F0}ms audio)",
+                                _audioBuffer.Length, _audioBuffer.Length / 32.0);
                             FlushBufferToQueue();
                         }
                         else
@@ -240,6 +262,8 @@ namespace ContactCenterPOC.Models
             {
                 if (_audioBuffer.Length > 0)
                 {
+                    _log.Info("[PIPE] Flushing buffer (timer 150ms): {BufLen}B ({BufMs:F0}ms audio)",
+                        _audioBuffer.Length, _audioBuffer.Length / 32.0);
                     FlushBufferToQueue();
                 }
             }
@@ -257,9 +281,13 @@ namespace ContactCenterPOC.Models
             {
                 if (_audioBuffer.Length > 0)
                 {
+                    _log.Info("[PIPE] Flushing buffer (AI turn done): {BufLen}B ({BufMs:F0}ms audio)",
+                        _audioBuffer.Length, _audioBuffer.Length / 32.0);
                     FlushBufferToQueue();
                 }
             }
+            _log.Info("[PIPE] AI turn complete. Total chunks={Chunks}, totalBuffered={TotalBytes}B, segments queued={Queued}, played={Played}",
+                _totalChunksReceived, _totalBytesBuffered, _queuedSegments, _playedSegments);
             return Task.CompletedTask;
         }
 
@@ -294,8 +322,13 @@ namespace ContactCenterPOC.Models
 
             try
             {
+                var writeStart = DateTime.UtcNow;
                 File.WriteAllBytes(fileName, data);
+                var writeMs = (DateTime.UtcNow - writeStart).TotalMilliseconds;
+                Interlocked.Increment(ref _queuedSegments);
                 _playbackQueue.Writer.TryWrite(fileName);
+                _log.Info("[PIPE] Seg#{SegNum} queued: {Bytes}B ({AudioMs:F0}ms audio), file write={WriteMs:F1}ms, pending={Pending}",
+                    segNum, data.Length, data.Length / 32.0, writeMs, _queuedSegments - _playedSegments);
             }
             catch (Exception ex)
             {
@@ -314,6 +347,7 @@ namespace ContactCenterPOC.Models
                 {
                     if (_bargeIn)
                     {
+                        _log.Info("[PLAY] Skipping {File} (barge-in)", Path.GetFileName(filePath));
                         TryDeleteFile(filePath);
                         continue;
                     }
@@ -322,13 +356,24 @@ namespace ContactCenterPOC.Models
                     {
                         if (_freeSwitchService != null)
                         {
-                            await _freeSwitchService.PlayAudioAsync(_callConnectionId, filePath);
-
-                            // Estimate duration from file size: 16kHz * 2 bytes = 32 bytes/ms
                             var fileLen = new FileInfo(filePath).Length;
                             var durationMs = (int)(fileLen / 32.0);
+                            var playStart = DateTime.UtcNow;
+
+                            _log.Info("[PLAY] Starting seg {File}: {Bytes}B ({DurMs}ms audio), pending after this={Pending}",
+                                Path.GetFileName(filePath), fileLen, durationMs, _queuedSegments - _playedSegments - 1);
+
+                            await _freeSwitchService.PlayAudioAsync(_callConnectionId, filePath);
+                            var eslMs = (DateTime.UtcNow - playStart).TotalMilliseconds;
+                            _log.Info("[PLAY] ESL command took {EslMs:F0}ms for {File}", eslMs, Path.GetFileName(filePath));
+
                             await _freeSwitchService.WaitForPlaybackStopAsync(
                                 _callConnectionId, filePath, durationMs + 500, _cts.Token);
+
+                            var totalPlayMs = (DateTime.UtcNow - playStart).TotalMilliseconds;
+                            Interlocked.Increment(ref _playedSegments);
+                            _log.Info("[PLAY] Finished seg {File}: totalWait={TotalMs:F0}ms (expected ~{DurMs}ms audio), played={Played}",
+                                Path.GetFileName(filePath), totalPlayMs, durationMs, _playedSegments);
                         }
                     }
                     catch (OperationCanceledException) { break; }
