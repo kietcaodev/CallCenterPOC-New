@@ -51,8 +51,11 @@ namespace ContactCenterPOC.Models
         private Task? _playbackTask;
         private volatile bool _bargeIn = false;
         private int _segmentCounter = 0;
-        // ~500ms of 16kHz PCM16 mono (16000 samples/s * 2 bytes = 32 bytes/ms * 500ms)
-        private const int BufferThresholdBytes = 16000;
+        private Timer? _flushTimer;
+        // Flush buffered audio every 150ms for low-latency streaming
+        private const int FlushIntervalMs = 150;
+        // Immediate flush if buffer exceeds ~1 second of 16kHz PCM16 mono
+        private const int MaxBufferBytes = 32000;
 
         public FreeSwitchMediaHandler(
             WebSocket webSocket,
@@ -103,6 +106,9 @@ namespace ContactCenterPOC.Models
 
             // Start background playback queue processor (plays temp audio files via ESL)
             _playbackTask = Task.Run(() => ProcessPlaybackQueueAsync());
+
+            // Initialize flush timer (armed on first audio byte, fires every 150ms)
+            _flushTimer = new Timer(FlushTimerCallback, null, Timeout.Infinite, Timeout.Infinite);
 
             if (_voiceApiMode == "VoiceLive" && _voiceLiveConfig != null && _voiceLiveConfig.IsConfigured)
             {
@@ -182,8 +188,7 @@ namespace ContactCenterPOC.Models
 
         /// <summary>
         /// Buffer AI audio chunks and queue them for playback via ESL uuid_broadcast.
-        /// mod_audio_stream (open-source) does not support receiving raw binary for playback,
-        /// so we write temp .r16 files and play them through FreeSWITCH directly.
+        /// Uses timer-based flushing (150ms) for low-latency streaming.
         /// </summary>
         public async Task SendMessageAsync(string acsJsonMessage)
         {
@@ -206,10 +211,15 @@ namespace ContactCenterPOC.Models
                     {
                         _audioBuffer.Write(resampled, 0, resampled.Length);
 
-                        // Flush segment when buffer reaches threshold (~500ms)
-                        if (_audioBuffer.Length >= BufferThresholdBytes)
+                        // Immediate flush for large buffers (>1s of audio)
+                        if (_audioBuffer.Length >= MaxBufferBytes)
                         {
                             FlushBufferToQueue();
+                        }
+                        else
+                        {
+                            // Arm the flush timer — fires after 150ms to collect nearby chunks
+                            _flushTimer?.Change(FlushIntervalMs, Timeout.Infinite);
                         }
                     }
                 }
@@ -222,11 +232,27 @@ namespace ContactCenterPOC.Models
         }
 
         /// <summary>
+        /// Timer callback: flush whatever audio has accumulated in the buffer.
+        /// </summary>
+        private void FlushTimerCallback(object? state)
+        {
+            lock (_bufferLock)
+            {
+                if (_audioBuffer.Length > 0)
+                {
+                    FlushBufferToQueue();
+                }
+            }
+        }
+
+        /// <summary>
         /// Flush any remaining buffered audio to a temp file and enqueue for playback.
         /// Called by AI service when model finishes generating audio for the current turn.
         /// </summary>
         public Task FlushAudioAsync()
         {
+            // Disarm timer — AI turn is done, flush immediately
+            _flushTimer?.Change(Timeout.Infinite, Timeout.Infinite);
             lock (_bufferLock)
             {
                 if (_audioBuffer.Length > 0)
@@ -331,6 +357,9 @@ namespace ContactCenterPOC.Models
         {
             _bargeIn = true;
 
+            // Disarm flush timer
+            _flushTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+
             // Clear audio buffer
             lock (_bufferLock)
             {
@@ -416,6 +445,9 @@ namespace ContactCenterPOC.Models
         public void Close()
         {
             _cts.Cancel();
+
+            // Stop flush timer
+            _flushTimer?.Dispose();
 
             // Complete playback queue and wait for processor to finish
             _playbackQueue.Writer.TryComplete();
