@@ -11,9 +11,9 @@ namespace ContactCenterPOC.Models
     /// <summary>
     /// WebSocket handler for FreeSWITCH audio streaming via mod_audio_stream.
     /// Receives binary PCM 16kHz from FreeSWITCH, resamples to 24kHz, sends to OpenAI/VoiceLive.
-    /// Receives AI audio at 24kHz, resamples to 16kHz, sends binary PCM directly back
-    /// through the same bidirectional WebSocket — no WAV files or ESL uuid_broadcast needed.
-    /// This mirrors the ACS approach: each audio chunk is streamed immediately (~20ms latency).
+    /// Receives AI audio at 24kHz, writes proper WAV files and plays via ESL uuid_broadcast.
+    /// Audio is kept at 24kHz (no downsampling) — FreeSWITCH handles resampling to channel rate
+    /// with its built-in high-quality resampler, avoiding quality loss from linear interpolation.
     /// </summary>
     public class FreeSwitchMediaHandler : IMediaStreamingHandler
     {
@@ -52,10 +52,15 @@ namespace ContactCenterPOC.Models
         private volatile bool _bargeIn = false;
         private int _segmentCounter = 0;
         private Timer? _flushTimer;
-        // Flush buffered audio every 150ms for low-latency streaming
-        private const int FlushIntervalMs = 150;
-        // Immediate flush if buffer exceeds ~1 second of 16kHz PCM16 mono
-        private const int MaxBufferBytes = 32000;
+        // Flush buffered audio every 300ms — balances latency vs segment count.
+        // Larger segments = fewer transitions = smoother playback.
+        private const int FlushIntervalMs = 300;
+        // Immediate flush if buffer exceeds ~2 seconds of 24kHz PCM16 mono (96000 = 2s * 24000 * 2)
+        private const int MaxBufferBytes = 96000;
+        // Bytes per ms for 24kHz 16-bit mono: 24000 samples/sec * 2 bytes = 48 bytes/ms
+        private const double BytesPerMs24k = 48.0;
+        // WAV header size
+        private const int WavHeaderSize = 44;
 
         // --- Debug timing ---
         private DateTime _firstChunkTime = DateTime.MinValue;
@@ -218,24 +223,24 @@ namespace ContactCenterPOC.Models
                     var sinceLastChunk = _lastChunkTime == DateTime.MinValue ? 0 : (now - _lastChunkTime).TotalMilliseconds;
                     _lastChunkTime = now;
 
-                    // Resample 24kHz → 16kHz for FreeSWITCH
-                    var resampled = AudioResampler.Downsample24kTo16k(audioBytes);
-                    var resampledMs = resampled.Length / 32.0; // 16kHz * 2 bytes = 32 bytes/ms
+                    // Keep original 24kHz audio — let FreeSWITCH resample with its built-in
+                    // high-quality resampler instead of our low-quality linear interpolation.
+                    var audioMs = audioBytes.Length / BytesPerMs24k;
 
-                    _log.Info("[PIPE] Chunk #{Num}: {OrigBytes}B@24k → {ResBytes}B@16k ({AudioMs:F0}ms audio), gap={Gap:F0}ms, queued={Queued}, played={Played}",
-                        _totalChunksReceived, audioBytes.Length, resampled.Length, resampledMs,
+                    _log.Info("[PIPE] Chunk #{Num}: {Bytes}B@24k ({AudioMs:F0}ms audio), gap={Gap:F0}ms, queued={Queued}, played={Played}",
+                        _totalChunksReceived, audioBytes.Length, audioMs,
                         sinceLastChunk, _queuedSegments - _playedSegments, _playedSegments);
 
                     lock (_bufferLock)
                     {
-                        _audioBuffer.Write(resampled, 0, resampled.Length);
-                        _totalBytesBuffered += resampled.Length;
+                        _audioBuffer.Write(audioBytes, 0, audioBytes.Length);
+                        _totalBytesBuffered += audioBytes.Length;
 
-                        // Immediate flush for large buffers (>1s of audio)
+                        // Immediate flush for large buffers (>2s of audio)
                         if (_audioBuffer.Length >= MaxBufferBytes)
                         {
                             _log.Info("[PIPE] Flushing buffer (max threshold): {BufLen}B ({BufMs:F0}ms audio)",
-                                _audioBuffer.Length, _audioBuffer.Length / 32.0);
+                                _audioBuffer.Length, _audioBuffer.Length / BytesPerMs24k);
                             FlushBufferToQueue();
                         }
                         else
@@ -262,8 +267,8 @@ namespace ContactCenterPOC.Models
             {
                 if (_audioBuffer.Length > 0)
                 {
-                    _log.Info("[PIPE] Flushing buffer (timer 150ms): {BufLen}B ({BufMs:F0}ms audio)",
-                        _audioBuffer.Length, _audioBuffer.Length / 32.0);
+                    _log.Info("[PIPE] Flushing buffer (timer {TimerMs}ms): {BufLen}B ({BufMs:F0}ms audio)",
+                        FlushIntervalMs, _audioBuffer.Length, _audioBuffer.Length / BytesPerMs24k);
                     FlushBufferToQueue();
                 }
             }
@@ -282,7 +287,7 @@ namespace ContactCenterPOC.Models
                 if (_audioBuffer.Length > 0)
                 {
                     _log.Info("[PIPE] Flushing buffer (AI turn done): {BufLen}B ({BufMs:F0}ms audio)",
-                        _audioBuffer.Length, _audioBuffer.Length / 32.0);
+                        _audioBuffer.Length, _audioBuffer.Length / BytesPerMs24k);
                     FlushBufferToQueue();
                 }
             }
@@ -306,7 +311,8 @@ namespace ContactCenterPOC.Models
         public void NotifyAiResponseFinished() { }
 
         /// <summary>
-        /// Write buffered audio to a temp .r16 file and enqueue for ESL playback.
+        /// Write buffered 24kHz audio to a temp WAV file and enqueue for ESL playback.
+        /// WAV format ensures FreeSWITCH correctly knows the sample rate (24kHz, 16-bit, mono).
         /// Must be called under _bufferLock.
         /// </summary>
         private void FlushBufferToQueue()
@@ -318,22 +324,56 @@ namespace ContactCenterPOC.Models
 
             var segNum = Interlocked.Increment(ref _segmentCounter);
             var tempDir = Path.GetTempPath();
-            var fileName = Path.Combine(tempDir, $"{_callConnectionId}_{segNum}.r16");
+            var fileName = Path.Combine(tempDir, $"{_callConnectionId}_{segNum}.wav");
 
             try
             {
                 var writeStart = DateTime.UtcNow;
-                File.WriteAllBytes(fileName, data);
+                WriteWavFile(fileName, data, 24000);
                 var writeMs = (DateTime.UtcNow - writeStart).TotalMilliseconds;
                 Interlocked.Increment(ref _queuedSegments);
                 _playbackQueue.Writer.TryWrite(fileName);
                 _log.Info("[PIPE] Seg#{SegNum} queued: {Bytes}B ({AudioMs:F0}ms audio), file write={WriteMs:F1}ms, pending={Pending}",
-                    segNum, data.Length, data.Length / 32.0, writeMs, _queuedSegments - _playedSegments);
+                    segNum, data.Length, data.Length / BytesPerMs24k, writeMs, _queuedSegments - _playedSegments);
             }
             catch (Exception ex)
             {
                 _log.Error(ex, "Failed to write audio segment to {File}", fileName);
             }
+        }
+
+        /// <summary>
+        /// Write a WAV file with proper RIFF/WAVE header.
+        /// Ensures FreeSWITCH correctly interprets sample rate, bit depth, and channels.
+        /// </summary>
+        private static void WriteWavFile(string path, byte[] pcmData, int sampleRate, int bitsPerSample = 16, int channels = 1)
+        {
+            int byteRate = sampleRate * channels * bitsPerSample / 8;
+            int blockAlign = channels * bitsPerSample / 8;
+            int dataSize = pcmData.Length;
+
+            using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+            using var bw = new BinaryWriter(fs);
+
+            // RIFF header
+            bw.Write(Encoding.ASCII.GetBytes("RIFF"));
+            bw.Write(36 + dataSize); // file size - 8
+            bw.Write(Encoding.ASCII.GetBytes("WAVE"));
+
+            // fmt chunk
+            bw.Write(Encoding.ASCII.GetBytes("fmt "));
+            bw.Write(16);                   // chunk size
+            bw.Write((short)1);             // PCM format
+            bw.Write((short)channels);
+            bw.Write(sampleRate);
+            bw.Write(byteRate);
+            bw.Write((short)blockAlign);
+            bw.Write((short)bitsPerSample);
+
+            // data chunk
+            bw.Write(Encoding.ASCII.GetBytes("data"));
+            bw.Write(dataSize);
+            bw.Write(pcmData);
         }
 
         /// <summary>
@@ -357,21 +397,23 @@ namespace ContactCenterPOC.Models
                         if (_freeSwitchService != null)
                         {
                             var fileLen = new FileInfo(filePath).Length;
-                            var durationMs = (int)(fileLen / 32.0);
+                            // WAV file: subtract 44-byte header to get PCM data length
+                            var dataLen = Math.Max(0, fileLen - WavHeaderSize);
+                            var durationMs = (int)(dataLen / BytesPerMs24k);
                             var playStart = DateTime.UtcNow;
 
                             _log.Info("[PLAY] Starting seg {File}: {Bytes}B ({DurMs}ms audio), pending after this={Pending}",
-                                Path.GetFileName(filePath), fileLen, durationMs, _queuedSegments - _playedSegments - 1);
+                                Path.GetFileName(filePath), dataLen, durationMs, _queuedSegments - _playedSegments - 1);
 
                             await _freeSwitchService.PlayAudioAsync(_callConnectionId, filePath);
                             var eslMs = (DateTime.UtcNow - playStart).TotalMilliseconds;
                             _log.Info("[PLAY] ESL command took {EslMs:F0}ms for {File}", eslMs, Path.GetFileName(filePath));
 
-                            // uuid_broadcast does not fire PLAYBACK_STOP events reliably,
-                            // so wait exactly the audio duration instead of relying on events.
+                            // Wait the audio duration. Add small padding (20ms) to avoid
+                            // cutting off the tail when uuid_broadcast starts the next segment.
                             if (durationMs > 0)
                             {
-                                await Task.Delay(durationMs, _cts.Token);
+                                await Task.Delay(durationMs + 20, _cts.Token);
                             }
 
                             var totalPlayMs = (DateTime.UtcNow - playStart).TotalMilliseconds;
