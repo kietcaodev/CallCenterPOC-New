@@ -8,9 +8,11 @@ using System.Text;
 namespace ContactCenterPOC.Models
 {
     /// <summary>
-    /// WebSocket handler for FreeSWITCH audio streaming.
+    /// WebSocket handler for FreeSWITCH audio streaming via mod_audio_stream.
     /// Receives binary PCM 16kHz from FreeSWITCH, resamples to 24kHz, sends to OpenAI/VoiceLive.
-    /// Receives AI audio at 24kHz, resamples to 16kHz, sends binary back to FreeSWITCH.
+    /// Receives AI audio at 24kHz, resamples to 16kHz, sends binary PCM directly back
+    /// through the same bidirectional WebSocket — no WAV files or ESL uuid_broadcast needed.
+    /// This mirrors the ACS approach: each audio chunk is streamed immediately (~20ms latency).
     /// </summary>
     public class FreeSwitchMediaHandler : IMediaStreamingHandler
     {
@@ -37,46 +39,9 @@ namespace ContactCenterPOC.Models
         private readonly string? _geminiLiveVoice;
         private readonly FreeSwitchService? _freeSwitchService;
 
-        // Audio format: FreeSWITCH sends 16kHz, OpenAI expects 24kHz
-        private const int FreeSwitchSampleRate = 16000;
-        private const int OpenAiSampleRate = 24000;
-
-        // Auto-flush threshold: flush buffer during generation every ~2 seconds of audio
-        // to minimize silence gaps when AI generates slower than real-time
-        // while keeping segments large enough to avoid choppy ESL playback.
-        // (PCM 16kHz mono 16-bit = 32000 bytes/sec, so 64000 = 2s)
-        private const int AutoFlushThresholdBytes = 64000;
-
-        // Minimum buffer size for an eager flush (1s = 32000 bytes).
-        // Prevents micro-segments that would cause choppy playback via ESL.
-        // Each uuid_broadcast has ~50-100ms overhead; sub-second files make this
-        // overhead a significant fraction of the segment duration.
-        private const int MinImmediateFlushBytes = 32000;
-
-        // Accumulation window (ms) for eager flush. When playback queue empties and
-        // _flushOnNextChunk is set, we wait this long before flushing to let more
-        // audio accumulate. This converts 7+ micro-segments into 2-3 larger ones.
-        private const int EagerAccumulationMs = 300;
-
-        // Buffer to accumulate audio chunks per AI turn, then play via ESL
-        private readonly MemoryStream _audioBuffer = new();
-        private int _turnCounter;
-
-        // Playback queue: ensures turns play sequentially without overlapping
-        private readonly ConcurrentQueue<(string filePath, int pcmBytes)> _playbackQueue = new();
-        private int _playbackRunning; // 0 = idle, 1 = running
-
-        // When set, the next AI audio chunk triggers an immediate flush regardless of threshold.
-        // Set when playback queue empties so the next audio segment plays without delay.
-        private volatile bool _flushOnNextChunk;
-
-        // Timestamp of last FlushAudioAsync — used to ignore stale VAD events
-        // (OpenAI delivers SpeechStarted AFTER ResponseFinished for already-processed speech)
-        private DateTime _lastFlushAt = DateTime.MinValue;
-
-        // Timestamp when _flushOnNextChunk first saw eligible audio — used for
-        // accumulation window. Reset when eager flush fires or flushOnNextChunk is cleared.
-        private DateTime _eagerAccumulateStart = DateTime.MinValue;
+        // Serialize WebSocket writes (reads and writes are independent but
+        // concurrent writes on the same WebSocket are not thread-safe).
+        private readonly SemaphoreSlim _sendLock = new(1, 1);
 
         public FreeSwitchMediaHandler(
             WebSocket webSocket,
@@ -202,38 +167,37 @@ namespace ContactCenterPOC.Models
         }
 
         /// <summary>
-        /// Buffer resampled audio from AI, or handle StopAudio (barge-in).
+        /// Stream resampled audio directly to FreeSWITCH via WebSocket (bidirectional mod_audio_stream),
+        /// or handle StopAudio (barge-in). Each audio chunk (~20ms) is sent immediately — no buffering,
+        /// no WAV files, no ESL uuid_broadcast. This mirrors the ACS approach for minimal latency.
         /// </summary>
         public async Task SendMessageAsync(string acsJsonMessage)
         {
             try
             {
-                // Handle barge-in: stop current playback when user starts speaking
+                // Barge-in: OpenAI already stopped generating audio server-side.
+                // Tell mod_audio_stream to clear its play buffer immediately so the
+                // caller stops hearing stale AI audio and the mic path is clean.
                 if (IsStopAudioMessage(acsJsonMessage))
                 {
-                    // Ignore stale VAD events that arrive right after flush.
-                    // OpenAI delivers SpeechStarted AFTER ResponseFinished for speech
-                    // the model already processed. FlushAudioAsync enqueues audio, then
-                    // StopAudio arrives 0-2ms later and clears the queue before
-                    // ProcessPlaybackQueueAsync can even dequeue it.
-                    var msSinceFlush = (DateTime.UtcNow - _lastFlushAt).TotalMilliseconds;
-                    if (msSinceFlush < 600)
+                    _log.Info("Barge-in: sending clearAudio to FreeSWITCH");
+                    if (_webSocket?.State == WebSocketState.Open)
                     {
-                        _log.Info("Ignoring stale barge-in ({Elapsed}ms after flush)",
-                            (int)msSinceFlush);
-                        return;
+                        var clearMsg = System.Text.Encoding.UTF8.GetBytes("{\"type\":\"clearAudio\"}");
+                        await _sendLock.WaitAsync(_cts.Token);
+                        try
+                        {
+                            await _webSocket.SendAsync(
+                                new ArraySegment<byte>(clearMsg),
+                                WebSocketMessageType.Text,
+                                endOfMessage: true,
+                                _cts.Token);
+                        }
+                        finally
+                        {
+                            _sendLock.Release();
+                        }
                     }
-
-                    _audioBuffer.SetLength(0);
-                    _eagerAccumulateStart = DateTime.MinValue;
-                    _flushOnNextChunk = false;
-                    // Clear any queued turns and stop current playback
-                    while (_playbackQueue.TryDequeue(out _)) { }
-                    if (_freeSwitchService != null)
-                    {
-                        await _freeSwitchService.BreakAudioAsync(_callConnectionId);
-                    }
-                    _log.Info("Barge-in: stopped playback and cleared queue");
                     return;
                 }
 
@@ -242,181 +206,43 @@ namespace ContactCenterPOC.Models
                 {
                     // Resample 24kHz → 16kHz for FreeSWITCH
                     var resampled = AudioResampler.Downsample24kTo16k(audioBytes);
-                    _audioBuffer.Write(resampled, 0, resampled.Length);
 
-                    // Auto-flush when buffer exceeds threshold for low-latency playback.
-                    // Without this, long AI responses are fully buffered before any audio plays,
-                    // causing 30+ seconds of silence until ResponseFinished.
-                    //
-                    // Eager-flush path: when playback queue emptied (_flushOnNextChunk),
-                    // a 300ms accumulation window lets more audio collect before flushing.
-                    // This converts many small (<0.5s) WAV files into fewer large (1-2s)
-                    // segments, dramatically reducing ESL uuid_broadcast overhead and
-                    // eliminating audible gaps between segments.
-                    var shouldFlush = _audioBuffer.Length >= AutoFlushThresholdBytes;
-                    if (!shouldFlush && _flushOnNextChunk && _audioBuffer.Length >= MinImmediateFlushBytes)
+                    // Send raw binary PCM directly through the bidirectional WebSocket.
+                    // mod_audio_stream receives this and injects it into the call audio path.
+                    if (_webSocket?.State == WebSocketState.Open)
                     {
-                        // Start the accumulation window on first eligible chunk
-                        if (_eagerAccumulateStart == DateTime.MinValue)
+                        await _sendLock.WaitAsync(_cts.Token);
+                        try
                         {
-                            _eagerAccumulateStart = DateTime.UtcNow;
+                            await _webSocket.SendAsync(
+                                new ArraySegment<byte>(resampled),
+                                WebSocketMessageType.Binary,
+                                endOfMessage: true,
+                                _cts.Token);
                         }
-                        // Flush only after the accumulation window expires
-                        if ((DateTime.UtcNow - _eagerAccumulateStart).TotalMilliseconds >= EagerAccumulationMs)
+                        finally
                         {
-                            shouldFlush = true;
-                            _flushOnNextChunk = false;
-                            _eagerAccumulateStart = DateTime.MinValue;
+                            _sendLock.Release();
                         }
-                    }
-                    if (shouldFlush)
-                    {
-                        await FlushAudioAsync();
                     }
                 }
             }
+            catch (OperationCanceledException) { }
             catch (Exception ex)
             {
-                _log.Error(ex, "Failed to buffer audio");
+                _log.Error(ex, "Failed to send audio to FreeSWITCH");
             }
         }
 
         /// <summary>
-        /// Called by AI service when model starts generating a response. (no-op in continuous mode)
+        /// Called by AI service when model starts generating a response. (no-op for direct streaming)
         /// </summary>
         public void NotifyAiResponseStarted() { }
 
         /// <summary>
-        /// Called by AI service when model finishes generating a response. (no-op in continuous mode)
+        /// Called by AI service when model finishes generating a response. (no-op for direct streaming)
         /// </summary>
         public void NotifyAiResponseFinished() { }
-
-        /// <summary>
-        /// Write buffered audio to a WAV file and enqueue for sequential playback via ESL.
-        /// </summary>
-        public async Task FlushAudioAsync()
-        {
-            if (_audioBuffer.Length == 0) return;
-
-            var pcmData = _audioBuffer.ToArray();
-            _audioBuffer.SetLength(0);
-            _turnCounter++;
-
-            var fileName = $"ai_{_callConnectionId}_{_turnCounter}.wav";
-            var filePath = Path.Combine(Path.GetTempPath(), fileName);
-
-            try
-            {
-                await using (var fs = new FileStream(filePath, FileMode.Create, FileAccess.Write))
-                {
-                    WriteWavHeader(fs, pcmData.Length, 16000, 1, 16);
-                    await fs.WriteAsync(pcmData);
-                }
-
-                _log.Info("Wrote audio turn #{Turn} ({Bytes} bytes) to {Path}",
-                    _turnCounter, pcmData.Length, filePath);
-
-                // Enqueue for sequential playback
-                _lastFlushAt = DateTime.UtcNow;
-                _playbackQueue.Enqueue((filePath, pcmData.Length));
-                if (Interlocked.CompareExchange(ref _playbackRunning, 1, 0) == 0)
-                {
-                    _ = Task.Run(ProcessPlaybackQueueAsync);
-                }
-            }
-            catch (Exception ex)
-            {
-                _log.Error(ex, "Failed to flush audio turn #{Turn}", _turnCounter);
-            }
-        }
-
-        /// <summary>
-        /// Process queued audio files sequentially: play one, wait for PLAYBACK_STOP event, then play next.
-        /// Audio from mic streams continuously to OpenAI during playback — OpenAI's server-side VAD
-        /// handles barge-in detection.
-        /// </summary>
-        private async Task ProcessPlaybackQueueAsync()
-        {
-            try
-            {
-                while (_playbackQueue.TryDequeue(out var item))
-                {
-                    await EslBroadcastAsync(item.filePath);
-                    // Wait for FreeSWITCH PLAYBACK_STOP event instead of estimating duration.
-                    // Fallback timeout = estimated duration + 400ms safety margin.
-                    var fallbackMs = (int)((double)item.pcmBytes / 32000 * 1000) + 400;
-                    _log.Info("Waiting for PLAYBACK_STOP (fallback {Fallback}ms)",
-                        fallbackMs);
-                    if (_freeSwitchService != null)
-                    {
-                        try
-                        {
-                            await _freeSwitchService.WaitForPlaybackStopAsync(_callConnectionId, item.filePath, fallbackMs, _cts.Token);
-                        }
-                        catch (OperationCanceledException) when (!_cts.IsCancellationRequested)
-                        {
-                            _log.Info("Playback wait cancelled by barge-in");
-                        }
-                    }
-                }
-
-                // Signal SendMessageAsync to flush immediately on the next audio chunk.
-                _flushOnNextChunk = true;
-
-                _log.Info("Playback queue empty");
-            }
-            catch (OperationCanceledException) { }
-            finally
-            {
-                Interlocked.Exchange(ref _playbackRunning, 0);
-                // Re-check in case items were enqueued while we were finishing
-                if (!_playbackQueue.IsEmpty && Interlocked.CompareExchange(ref _playbackRunning, 1, 0) == 0)
-                {
-                    _ = Task.Run(ProcessPlaybackQueueAsync);
-                }
-            }
-        }
-
-        /// <summary>
-        /// Play audio file on the call via FreeSwitchService ESL connection.
-        /// </summary>
-        private async Task EslBroadcastAsync(string filePath)
-        {
-            if (_freeSwitchService == null) return;
-
-            _log.Info("ESL IsConnected={Connected}, calling PlayAudioAsync for {Path}",
-                _freeSwitchService.IsConnected, filePath);
-
-            try
-            {
-                var result = await _freeSwitchService.PlayAudioAsync(_callConnectionId, filePath);
-                _log.Info("ESL uuid_broadcast result: {Result}", result);
-            }
-            catch (Exception ex)
-            {
-                _log.Error(ex, "ESL uuid_broadcast failed");
-            }
-        }
-
-        private static void WriteWavHeader(Stream stream, int dataLength, int sampleRate, int channels, int bitsPerSample)
-        {
-            var byteRate = sampleRate * channels * bitsPerSample / 8;
-            var blockAlign = (short)(channels * bitsPerSample / 8);
-            using var bw = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
-            bw.Write(Encoding.ASCII.GetBytes("RIFF"));
-            bw.Write(36 + dataLength);
-            bw.Write(Encoding.ASCII.GetBytes("WAVE"));
-            bw.Write(Encoding.ASCII.GetBytes("fmt "));
-            bw.Write(16);
-            bw.Write((short)1);
-            bw.Write((short)channels);
-            bw.Write(sampleRate);
-            bw.Write(byteRate);
-            bw.Write(blockAlign);
-            bw.Write((short)bitsPerSample);
-            bw.Write(Encoding.ASCII.GetBytes("data"));
-            bw.Write(dataLength);
-        }
 
         private static bool IsStopAudioMessage(string json)
         {
@@ -471,6 +297,7 @@ namespace ContactCenterPOC.Models
         {
             _cts.Cancel();
             _cts.Dispose();
+            _sendLock.Dispose();
         }
 
         /// <summary>
