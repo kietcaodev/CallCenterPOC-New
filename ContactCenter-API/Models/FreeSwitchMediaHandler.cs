@@ -52,8 +52,10 @@ namespace ContactCenterPOC.Models
         private volatile bool _bargeIn = false;
         private int _segmentCounter = 0;
         private Timer? _flushTimer;
-        // Flush buffered audio every 300ms — balances latency vs segment count.
-        // Larger segments = fewer transitions = smoother playback.
+        // Pre-buffer: accumulate ~1.5 seconds of audio before starting playback.
+        // This builds a jitter buffer so the playback queue stays ahead of chunk arrivals.
+        private const int PreBufferMs = 1500;
+        // After pre-buffer, flush every 300ms to collect nearby chunks into bigger segments.
         private const int FlushIntervalMs = 300;
         // Immediate flush if buffer exceeds ~2 seconds of 24kHz PCM16 mono (96000 = 2s * 24000 * 2)
         private const int MaxBufferBytes = 96000;
@@ -61,6 +63,10 @@ namespace ContactCenterPOC.Models
         private const double BytesPerMs24k = 48.0;
         // WAV header size
         private const int WavHeaderSize = 44;
+
+        // Pre-buffering state: delay first playback to build jitter buffer
+        private volatile bool _preBufferingPhase = false;
+        private volatile bool _preBufferTimerArmed = false;
 
         // --- Debug timing ---
         private DateTime _firstChunkTime = DateTime.MinValue;
@@ -242,10 +248,23 @@ namespace ContactCenterPOC.Models
                             _log.Info("[PIPE] Flushing buffer (max threshold): {BufLen}B ({BufMs:F0}ms audio)",
                                 _audioBuffer.Length, _audioBuffer.Length / BytesPerMs24k);
                             FlushBufferToQueue();
+                            _preBufferingPhase = false;
+                            _preBufferTimerArmed = false;
+                        }
+                        else if (_preBufferingPhase)
+                        {
+                            // Pre-buffering: arm a longer timer only on the first chunk.
+                            // Subsequent chunks during pre-buffer just accumulate silently.
+                            if (!_preBufferTimerArmed)
+                            {
+                                _flushTimer?.Change(PreBufferMs, Timeout.Infinite);
+                                _preBufferTimerArmed = true;
+                                _log.Info("[PIPE] Pre-buffering started — will flush in {Ms}ms", PreBufferMs);
+                            }
                         }
                         else
                         {
-                            // Arm the flush timer — fires after 150ms to collect nearby chunks
+                            // Normal mode: arm flush timer on each chunk (resets on every chunk)
                             _flushTimer?.Change(FlushIntervalMs, Timeout.Infinite);
                         }
                     }
@@ -267,10 +286,14 @@ namespace ContactCenterPOC.Models
             {
                 if (_audioBuffer.Length > 0)
                 {
-                    _log.Info("[PIPE] Flushing buffer (timer {TimerMs}ms): {BufLen}B ({BufMs:F0}ms audio)",
-                        FlushIntervalMs, _audioBuffer.Length, _audioBuffer.Length / BytesPerMs24k);
+                    var timerType = _preBufferingPhase ? "pre-buffer" : "timer";
+                    var timerMs = _preBufferingPhase ? PreBufferMs : FlushIntervalMs;
+                    _log.Info("[PIPE] Flushing buffer ({Type} {TimerMs}ms): {BufLen}B ({BufMs:F0}ms audio)",
+                        timerType, timerMs, _audioBuffer.Length, _audioBuffer.Length / BytesPerMs24k);
                     FlushBufferToQueue();
                 }
+                _preBufferingPhase = false;
+                _preBufferTimerArmed = false;
             }
         }
 
@@ -284,6 +307,8 @@ namespace ContactCenterPOC.Models
             _flushTimer?.Change(Timeout.Infinite, Timeout.Infinite);
             lock (_bufferLock)
             {
+                _preBufferingPhase = false;
+                _preBufferTimerArmed = false;
                 if (_audioBuffer.Length > 0)
                 {
                     _log.Info("[PIPE] Flushing buffer (AI turn done): {BufLen}B ({BufMs:F0}ms audio)",
@@ -303,6 +328,8 @@ namespace ContactCenterPOC.Models
         public void NotifyAiResponseStarted()
         {
             _bargeIn = false;
+            _preBufferingPhase = true;
+            _preBufferTimerArmed = false;
         }
 
         /// <summary>
