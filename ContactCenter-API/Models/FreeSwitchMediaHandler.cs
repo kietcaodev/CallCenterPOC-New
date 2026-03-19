@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.SignalR;
 using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using System.Text;
+using System.Threading.Channels;
 
 namespace ContactCenterPOC.Models
 {
@@ -42,6 +43,16 @@ namespace ContactCenterPOC.Models
         // Serialize WebSocket writes (reads and writes are independent but
         // concurrent writes on the same WebSocket are not thread-safe).
         private readonly SemaphoreSlim _sendLock = new(1, 1);
+
+        // --- Buffered playback via ESL uuid_broadcast ---
+        private readonly object _bufferLock = new();
+        private MemoryStream _audioBuffer = new();
+        private readonly Channel<string> _playbackQueue = Channel.CreateUnbounded<string>();
+        private Task? _playbackTask;
+        private volatile bool _bargeIn = false;
+        private int _segmentCounter = 0;
+        // ~500ms of 16kHz PCM16 mono (16000 samples/s * 2 bytes = 32 bytes/ms * 500ms)
+        private const int BufferThresholdBytes = 16000;
 
         public FreeSwitchMediaHandler(
             WebSocket webSocket,
@@ -89,6 +100,9 @@ namespace ContactCenterPOC.Models
         public async Task ProcessWebSocketAsync(string callContextPrompt)
         {
             if (_webSocket == null) return;
+
+            // Start background playback queue processor (plays temp audio files via ESL)
+            _playbackTask = Task.Run(() => ProcessPlaybackQueueAsync());
 
             if (_voiceApiMode == "VoiceLive" && _voiceLiveConfig != null && _voiceLiveConfig.IsConfigured)
             {
@@ -167,37 +181,18 @@ namespace ContactCenterPOC.Models
         }
 
         /// <summary>
-        /// Stream resampled audio directly to FreeSWITCH via WebSocket (bidirectional mod_audio_stream),
-        /// or handle StopAudio (barge-in). Each audio chunk (~20ms) is sent immediately — no buffering,
-        /// no WAV files, no ESL uuid_broadcast. This mirrors the ACS approach for minimal latency.
+        /// Buffer AI audio chunks and queue them for playback via ESL uuid_broadcast.
+        /// mod_audio_stream (open-source) does not support receiving raw binary for playback,
+        /// so we write temp .r16 files and play them through FreeSWITCH directly.
         /// </summary>
         public async Task SendMessageAsync(string acsJsonMessage)
         {
             try
             {
-                // Barge-in: OpenAI already stopped generating audio server-side.
-                // Tell mod_audio_stream to clear its play buffer immediately so the
-                // caller stops hearing stale AI audio and the mic path is clean.
+                // Barge-in: stop current playback and clear queue via ESL uuid_break
                 if (IsStopAudioMessage(acsJsonMessage))
                 {
-                    _log.Info("Barge-in: sending clearAudio to FreeSWITCH");
-                    if (_webSocket?.State == WebSocketState.Open)
-                    {
-                        var clearMsg = System.Text.Encoding.UTF8.GetBytes("{\"type\":\"clearAudio\"}");
-                        await _sendLock.WaitAsync(_cts.Token);
-                        try
-                        {
-                            await _webSocket.SendAsync(
-                                new ArraySegment<byte>(clearMsg),
-                                WebSocketMessageType.Text,
-                                endOfMessage: true,
-                                _cts.Token);
-                        }
-                        finally
-                        {
-                            _sendLock.Release();
-                        }
-                    }
+                    await HandleBargeInAsync();
                     return;
                 }
 
@@ -207,22 +202,14 @@ namespace ContactCenterPOC.Models
                     // Resample 24kHz → 16kHz for FreeSWITCH
                     var resampled = AudioResampler.Downsample24kTo16k(audioBytes);
 
-                    // Send raw binary PCM directly through the bidirectional WebSocket.
-                    // mod_audio_stream receives this and injects it into the call audio path.
-                    if (_webSocket?.State == WebSocketState.Open)
+                    lock (_bufferLock)
                     {
-                        await _sendLock.WaitAsync(_cts.Token);
-                        try
+                        _audioBuffer.Write(resampled, 0, resampled.Length);
+
+                        // Flush segment when buffer reaches threshold (~500ms)
+                        if (_audioBuffer.Length >= BufferThresholdBytes)
                         {
-                            await _webSocket.SendAsync(
-                                new ArraySegment<byte>(resampled),
-                                WebSocketMessageType.Binary,
-                                endOfMessage: true,
-                                _cts.Token);
-                        }
-                        finally
-                        {
-                            _sendLock.Release();
+                            FlushBufferToQueue();
                         }
                     }
                 }
@@ -230,19 +217,152 @@ namespace ContactCenterPOC.Models
             catch (OperationCanceledException) { }
             catch (Exception ex)
             {
-                _log.Error(ex, "Failed to send audio to FreeSWITCH");
+                _log.Error(ex, "Failed to process audio for FreeSWITCH playback");
             }
         }
 
         /// <summary>
-        /// Called by AI service when model starts generating a response. (no-op for direct streaming)
+        /// Flush any remaining buffered audio to a temp file and enqueue for playback.
+        /// Called by AI service when model finishes generating audio for the current turn.
         /// </summary>
-        public void NotifyAiResponseStarted() { }
+        public Task FlushAudioAsync()
+        {
+            lock (_bufferLock)
+            {
+                if (_audioBuffer.Length > 0)
+                {
+                    FlushBufferToQueue();
+                }
+            }
+            return Task.CompletedTask;
+        }
 
         /// <summary>
-        /// Called by AI service when model finishes generating a response. (no-op for direct streaming)
+        /// Called by AI service when model starts generating a response.
+        /// Reset barge-in flag so new audio segments are played.
+        /// </summary>
+        public void NotifyAiResponseStarted()
+        {
+            _bargeIn = false;
+        }
+
+        /// <summary>
+        /// Called by AI service when model finishes generating a response.
         /// </summary>
         public void NotifyAiResponseFinished() { }
+
+        /// <summary>
+        /// Write buffered audio to a temp .r16 file and enqueue for ESL playback.
+        /// Must be called under _bufferLock.
+        /// </summary>
+        private void FlushBufferToQueue()
+        {
+            var data = _audioBuffer.ToArray();
+            _audioBuffer.SetLength(0);
+
+            if (data.Length == 0) return;
+
+            var segNum = Interlocked.Increment(ref _segmentCounter);
+            var tempDir = Path.GetTempPath();
+            var fileName = Path.Combine(tempDir, $"{_callConnectionId}_{segNum}.r16");
+
+            try
+            {
+                File.WriteAllBytes(fileName, data);
+                _playbackQueue.Writer.TryWrite(fileName);
+            }
+            catch (Exception ex)
+            {
+                _log.Error(ex, "Failed to write audio segment to {File}", fileName);
+            }
+        }
+
+        /// <summary>
+        /// Background task: sequentially play queued audio segments via ESL uuid_broadcast.
+        /// </summary>
+        private async Task ProcessPlaybackQueueAsync()
+        {
+            try
+            {
+                await foreach (var filePath in _playbackQueue.Reader.ReadAllAsync(_cts.Token))
+                {
+                    if (_bargeIn)
+                    {
+                        TryDeleteFile(filePath);
+                        continue;
+                    }
+
+                    try
+                    {
+                        if (_freeSwitchService != null)
+                        {
+                            await _freeSwitchService.PlayAudioAsync(_callConnectionId, filePath);
+
+                            // Estimate duration from file size: 16kHz * 2 bytes = 32 bytes/ms
+                            var fileLen = new FileInfo(filePath).Length;
+                            var durationMs = (int)(fileLen / 32.0);
+                            await _freeSwitchService.WaitForPlaybackStopAsync(
+                                _callConnectionId, filePath, durationMs + 500, _cts.Token);
+                        }
+                    }
+                    catch (OperationCanceledException) { break; }
+                    catch (Exception ex)
+                    {
+                        _log.Warn(ex, "Playback failed for {File}", filePath);
+                    }
+                    finally
+                    {
+                        TryDeleteFile(filePath);
+                    }
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                _log.Error(ex, "Playback queue processor error");
+            }
+        }
+
+        /// <summary>
+        /// Handle barge-in: stop current playback, clear buffer and queue.
+        /// Uses ESL uuid_break instead of WebSocket clearAudio (not supported by open-source mod_audio_stream).
+        /// </summary>
+        private async Task HandleBargeInAsync()
+        {
+            _bargeIn = true;
+
+            // Clear audio buffer
+            lock (_bufferLock)
+            {
+                _audioBuffer.SetLength(0);
+            }
+
+            // Drain queued files
+            while (_playbackQueue.Reader.TryRead(out var filePath))
+            {
+                TryDeleteFile(filePath);
+            }
+
+            // Stop current playback via ESL
+            if (_freeSwitchService != null)
+            {
+                try
+                {
+                    await _freeSwitchService.BreakAudioAsync(_callConnectionId);
+                }
+                catch (Exception ex)
+                {
+                    _log.Warn(ex, "Barge-in ESL uuid_break failed");
+                }
+            }
+
+            _log.Info("Barge-in: cleared queue and stopped playback via ESL");
+        }
+
+        private static void TryDeleteFile(string path)
+        {
+            try { if (File.Exists(path)) File.Delete(path); } catch { /* best-effort cleanup */ }
+        }
 
         private static bool IsStopAudioMessage(string json)
         {
@@ -296,8 +416,20 @@ namespace ContactCenterPOC.Models
         public void Close()
         {
             _cts.Cancel();
+
+            // Complete playback queue and wait for processor to finish
+            _playbackQueue.Writer.TryComplete();
+            try { _playbackTask?.Wait(TimeSpan.FromSeconds(2)); } catch { /* ignore */ }
+
+            // Clean up any remaining queued files
+            while (_playbackQueue.Reader.TryRead(out var filePath))
+            {
+                TryDeleteFile(filePath);
+            }
+
             _cts.Dispose();
             _sendLock.Dispose();
+            _audioBuffer.Dispose();
         }
 
         /// <summary>
