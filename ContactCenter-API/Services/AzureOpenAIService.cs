@@ -25,7 +25,16 @@ namespace ContactCenterPOC.Services
         private readonly EmotionAnalysisService? _emotionService;
         private readonly ConcurrentDictionary<string, ActiveCall>? _activeCalls;
         private readonly string _selectedVoice;
-        private bool _sessionReady = false;
+        private readonly IConfiguration _configuration;
+        private readonly string? _prompt;
+        private volatile bool _sessionReady = false;
+        private volatile bool _sessionAlive = false;
+        private readonly SemaphoreSlim _reconnectLock = new(1, 1);
+        private int _reconnectAttempts = 0;
+        private const int MaxReconnectAttempts = 3;
+        private const int ReconnectDelayMs = 2000;
+        private int _sendErrorCount = 0;
+        private DateTime _lastSendErrorLog = DateTime.MinValue;
 
         public AzureOpenAIService(
             IMediaStreamingHandler mediaStreaming,
@@ -51,12 +60,15 @@ namespace ContactCenterPOC.Services
             _emotionService = emotionService;
             _activeCalls = activeCalls;
             _selectedVoice = selectedVoice ?? "alloy";
+            _configuration = configuration;
+            _prompt = null;
 
             try
             {
                 _log.Info("Creating AI session (no prompt)...");
                 m_aiSession = CreateAISessionAsync(configuration, null!).GetAwaiter().GetResult();
                 _sessionReady = true;
+                _sessionAlive = true;
                 _log.Info("AI session created successfully");
             }
             catch (Exception ex)
@@ -91,12 +103,15 @@ namespace ContactCenterPOC.Services
             _emotionService = emotionService;
             _activeCalls = activeCalls;
             _selectedVoice = selectedVoice ?? "alloy";
+            _configuration = configuration;
+            _prompt = prompt;
 
             try
             {
                 _log.Info("Creating AI session with prompt ({PromptLen} chars)...", prompt?.Length ?? 0);
                 m_aiSession = CreateAISessionAsync(configuration, prompt!).GetAwaiter().GetResult();
                 _sessionReady = true;
+                _sessionAlive = true;
                 _log.Info("AI session created successfully");
             }
             catch (Exception ex)
@@ -344,15 +359,77 @@ namespace ContactCenterPOC.Services
             catch (OperationCanceledException e)
             {
                 _log.Info("AI response loop cancelled: {Message}", e.Message);
+                _sessionAlive = false;
             }
             catch (Exception ex)
             {
+                _sessionAlive = false;
                 _log.Error(ex, "Exception during AI streaming");
-                if (_hangUpCallback != null)
+
+                // Attempt auto-reconnect if not cancelled
+                if (!m_cts.IsCancellationRequested)
                 {
-                    try { await _hangUpCallback(_callConnectionId); }
-                    catch (Exception cbEx) { _log.Warn(cbEx, "Hang-up callback failed after AI error"); }
+                    var reconnected = await TryReconnectAsync();
+                    if (reconnected)
+                    {
+                        _log.Info("Reconnected successfully, restarting AI response loop");
+                        // Restart the response loop recursively
+                        await GetOpenAiStreamResponseAsync();
+                        return;
+                    }
+                    else
+                    {
+                        _log.Error("Failed to reconnect after {Attempts} attempts, hanging up", _reconnectAttempts);
+                        if (_hangUpCallback != null)
+                        {
+                            try { await _hangUpCallback(_callConnectionId); }
+                            catch (Exception cbEx) { _log.Warn(cbEx, "Hang-up callback failed after AI error"); }
+                        }
+                    }
                 }
+            }
+        }
+
+        private async Task<bool> TryReconnectAsync()
+        {
+            if (!await _reconnectLock.WaitAsync(0))
+            {
+                _log.Info("Reconnect already in progress, skipping");
+                return false;
+            }
+
+            try
+            {
+                while (_reconnectAttempts < MaxReconnectAttempts && !m_cts.IsCancellationRequested)
+                {
+                    _reconnectAttempts++;
+                    _log.Info("Reconnect attempt {Attempt}/{Max}...", _reconnectAttempts, MaxReconnectAttempts);
+
+                    try
+                    {
+                        await Task.Delay(ReconnectDelayMs * _reconnectAttempts, m_cts.Token);
+
+                        // Dispose old session safely
+                        try { m_aiSession?.Dispose(); } catch { /* ignore */ }
+
+                        // Re-create session
+                        m_aiSession = await CreateAISessionAsync(_configuration, _prompt!);
+                        _sessionAlive = true;
+                        _reconnectAttempts = 0;
+                        _sendErrorCount = 0;
+                        _log.Info("AI session reconnected successfully");
+                        return true;
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.Warn(ex, "Reconnect attempt {Attempt} failed", _reconnectAttempts);
+                    }
+                }
+                return false;
+            }
+            finally
+            {
+                _reconnectLock.Release();
             }
         }
 
@@ -465,13 +542,38 @@ namespace ContactCenterPOC.Services
 
         public async Task SendAudioToExternalAI(MemoryStream memoryStream)
         {
+            if (!_sessionAlive)
+            {
+                // Session is dead, silently drop audio (avoid error spam)
+                return;
+            }
+
             try
             {
                 await m_aiSession.SendInputAudioAsync(memoryStream);
+                // Reset error counter on success
+                _sendErrorCount = 0;
+            }
+            catch (ObjectDisposedException)
+            {
+                _sessionAlive = false;
+                var count = Interlocked.Increment(ref _sendErrorCount);
+                if (count == 1)
+                {
+                    _log.Error("AI session WebSocket disposed - stopping audio send. Will attempt reconnect.");
+                }
             }
             catch (Exception ex)
             {
-                _log.Error(ex, "Failed to send audio to OpenAI ({ByteCount} bytes)", memoryStream.Length);
+                var count = Interlocked.Increment(ref _sendErrorCount);
+                var now = DateTime.UtcNow;
+                // Throttle error logging: log first error, then at most once per 5 seconds
+                if (count == 1 || (now - _lastSendErrorLog).TotalSeconds >= 5)
+                {
+                    _log.Error(ex, "Failed to send audio to OpenAI ({ByteCount} bytes, errorCount={ErrorCount})",
+                        memoryStream.Length, count);
+                    _lastSendErrorLog = now;
+                }
             }
         }
 
@@ -496,9 +598,10 @@ namespace ContactCenterPOC.Services
 
         public void Close()
         {
+            _sessionAlive = false;
             m_cts.Cancel();
             m_cts.Dispose();
-            m_aiSession.Dispose();
+            try { m_aiSession?.Dispose(); } catch { /* ignore */ }
         }
     }
 }
