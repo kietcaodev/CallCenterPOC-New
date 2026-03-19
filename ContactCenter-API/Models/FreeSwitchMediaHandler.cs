@@ -367,12 +367,16 @@ namespace ContactCenterPOC.Models
                             var eslMs = (DateTime.UtcNow - playStart).TotalMilliseconds;
                             _log.Info("[PLAY] ESL command took {EslMs:F0}ms for {File}", eslMs, Path.GetFileName(filePath));
 
-                            await _freeSwitchService.WaitForPlaybackStopAsync(
-                                _callConnectionId, filePath, durationMs + 500, _cts.Token);
+                            // uuid_broadcast does not fire PLAYBACK_STOP events reliably,
+                            // so wait exactly the audio duration instead of relying on events.
+                            if (durationMs > 0)
+                            {
+                                await Task.Delay(durationMs, _cts.Token);
+                            }
 
                             var totalPlayMs = (DateTime.UtcNow - playStart).TotalMilliseconds;
                             Interlocked.Increment(ref _playedSegments);
-                            _log.Info("[PLAY] Finished seg {File}: totalWait={TotalMs:F0}ms (expected ~{DurMs}ms audio), played={Played}",
+                            _log.Info("[PLAY] Finished seg {File}: totalWait={TotalMs:F0}ms (audio={DurMs}ms), played={Played}",
                                 Path.GetFileName(filePath), totalPlayMs, durationMs, _playedSegments);
                         }
                     }
