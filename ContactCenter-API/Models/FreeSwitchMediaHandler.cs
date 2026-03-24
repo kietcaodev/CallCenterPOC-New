@@ -263,7 +263,7 @@ namespace ContactCenterPOC.Models
             _bargeIn = true;
 
             // Send killAudio JSON text message to mod_audio_fork
-            var killAudioJson = "{\"type\":\"killAudio\"}"u8;
+            var killAudioJson = Encoding.UTF8.GetBytes("{\"type\":\"killAudio\"}");
 
             await _sendLock.WaitAsync(_cts.Token);
             try
@@ -271,7 +271,7 @@ namespace ContactCenterPOC.Models
                 if (_webSocket?.State == WebSocketState.Open)
                 {
                     await _webSocket.SendAsync(
-                        new ArraySegment<byte>(killAudioJson.ToArray()),
+                        new ArraySegment<byte>(killAudioJson),
                         WebSocketMessageType.Text,
                         true,
                         _cts.Token);
