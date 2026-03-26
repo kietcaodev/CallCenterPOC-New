@@ -36,6 +36,10 @@ namespace ContactCenterPOC.Services
         private int _sendErrorCount = 0;
         private DateTime _lastSendErrorLog = DateTime.MinValue;
 
+        // TTS mode: when set, GPT audio output is ignored and text is fed to Azure TTS instead.
+        private readonly AzureTtsService? _ttsService;
+        private string? _pendingTtsText;
+
         public AzureOpenAIService(
             IMediaStreamingHandler mediaStreaming,
             IConfiguration configuration,
@@ -89,7 +93,8 @@ namespace ContactCenterPOC.Services
             SentimentAnalysisService? sentimentService = null,
             ConcurrentDictionary<string, ActiveCall>? activeCalls = null,
             EmotionAnalysisService? emotionService = null,
-            string? selectedVoice = null)
+            string? selectedVoice = null,
+            AzureTtsService? ttsService = null)
         {
             m_mediaStreaming = mediaStreaming;
             m_cts = new CancellationTokenSource();
@@ -105,6 +110,7 @@ namespace ContactCenterPOC.Services
             _selectedVoice = selectedVoice ?? "alloy";
             _configuration = configuration;
             _prompt = prompt;
+            _ttsService = ttsService;
 
             try
             {
@@ -246,7 +252,10 @@ namespace ContactCenterPOC.Services
                     if (update is ConversationItemStreamingStartedUpdate itemStartedUpdate)
                     {
                         _log.Info("Begin streaming of new item");
-                        m_mediaStreaming.NotifyAiResponseStarted();
+                        _pendingTtsText = null; // reset per-turn text buffer
+                        if (_ttsService == null)
+                            m_mediaStreaming.NotifyAiResponseStarted(); // immediate for native audio mode
+                        // TTS mode: defer NotifyAiResponseStarted until TTS audio is ready
                     }
 
                     // Audio transcript updates contain the incremental text matching the generated
@@ -254,6 +263,9 @@ namespace ContactCenterPOC.Services
                     if (update is ConversationItemStreamingAudioTranscriptionFinishedUpdate outputTranscriptDeltaUpdate)
                     {
                         _log.Info("AI transcript: {Transcript}", outputTranscriptDeltaUpdate.Transcript);
+                        // Save for TTS synthesis on response-finished event
+                        if (_ttsService != null)
+                            _pendingTtsText = outputTranscriptDeltaUpdate.Transcript;
                         var aiEntry = new TranscriptEntry
                         {
                             CallConnectionId = _callConnectionId,
@@ -283,14 +295,22 @@ namespace ContactCenterPOC.Services
                     {
                         if (deltaUpdate.AudioBytes != null)
                         {
-                            audioChunkCount++;
-                            if (audioChunkCount <= 3 || audioChunkCount % 50 == 0)
+                            if (_ttsService != null)
                             {
-                                _log.Info("Sending audio chunk #{ChunkNum} ({ByteCount} bytes) to ACS", 
-                                    audioChunkCount, deltaUpdate.AudioBytes.ToArray().Length);
+                                // TTS mode: discard GPT audio — text transcript collected separately
+                                audioChunkCount++; // still count for logging
                             }
-                            var jsonString = MediaStreamingData.GetAudioDataForOutbound(deltaUpdate.AudioBytes.ToArray());
-                            await m_mediaStreaming.SendMessageAsync(jsonString);
+                            else
+                            {
+                                audioChunkCount++;
+                                if (audioChunkCount <= 3 || audioChunkCount % 50 == 0)
+                                {
+                                    _log.Info("Sending audio chunk #{ChunkNum} ({ByteCount} bytes) to ACS", 
+                                        audioChunkCount, deltaUpdate.AudioBytes.ToArray().Length);
+                                }
+                                var jsonString = MediaStreamingData.GetAudioDataForOutbound(deltaUpdate.AudioBytes.ToArray());
+                                await m_mediaStreaming.SendMessageAsync(jsonString);
+                            }
                         }
                         else
                         {
@@ -352,13 +372,41 @@ namespace ContactCenterPOC.Services
 
                     if (update is ConversationResponseFinishedUpdate turnFinishedUpdate)
                     {
-                        _log.Info("Model turn generation finished. Status: {Status}. Total audio chunks sent: {ChunkCount}", 
+                        _log.Info("Model turn generation finished. Status: {Status}. Total audio chunks (GPT): {ChunkCount}", 
                             turnFinishedUpdate.Status, audioChunkCount);
-                        // Flush remaining buffered audio BEFORE signaling finished,
-                        // otherwise ProcessPlaybackQueue wakes up, sees empty queue + !_aiGenerating,
-                        // and unmutes mic before the last segment is enqueued.
-                        await m_mediaStreaming.FlushAudioAsync();
-                        m_mediaStreaming.NotifyAiResponseFinished();
+
+                        if (_ttsService != null)
+                        {
+                            // TTS mode: synthesize accumulated AI text and play via jitter buffer
+                            var textToSpeak = _pendingTtsText;
+                            if (!string.IsNullOrWhiteSpace(textToSpeak) && turnFinishedUpdate.Status != ConversationStatus.Cancelled)
+                            {
+                                _log.Info("[TTS] Synthesizing {Chars} chars...", textToSpeak.Length);
+                                var pcmBytes = await _ttsService.SynthesizeAsync(textToSpeak, null, m_cts.Token);
+                                if (pcmBytes != null && pcmBytes.Length > 0)
+                                {
+                                    m_mediaStreaming.NotifyAiResponseStarted();
+                                    await m_mediaStreaming.FeedPcm16AudioAsync(pcmBytes);
+                                    await m_mediaStreaming.FlushAudioAsync();
+                                }
+                                else
+                                {
+                                    _log.Warn("[TTS] Synthesis returned empty — skipping playback");
+                                }
+                            }
+                            else
+                            {
+                                _log.Info("[TTS] No text to speak (status={Status}, text='{Text}')",
+                                    turnFinishedUpdate.Status, textToSpeak ?? "(null)");
+                            }
+                            m_mediaStreaming.NotifyAiResponseFinished();
+                        }
+                        else
+                        {
+                            // Native audio mode: flush jitter buffer and unmute
+                            await m_mediaStreaming.FlushAudioAsync();
+                            m_mediaStreaming.NotifyAiResponseFinished();
+                        }
                     }
 
                     if (update is ConversationErrorUpdate errorUpdate)

@@ -24,6 +24,7 @@ namespace ContactCenterPOC.Services
         private readonly SettingsService? _settingsService;
         private readonly VoiceLiveConfig _voiceLiveConfig;
         private readonly GeminiLiveConfig _geminiLiveConfig;
+        private readonly AzureTtsService? _ttsService;
 
         // Thread-safe dictionaries for concurrent call handling
         private readonly ConcurrentDictionary<string, ActiveCall> _activeCalls = new();
@@ -31,7 +32,7 @@ namespace ContactCenterPOC.Services
 
         public ConcurrentDictionary<string, ActiveCall> ActiveCalls => _activeCalls;
 
-        public CallService(IConfiguration configuration, ILogger<CallService> logger, IHubContext<TranscriptHub> hubContext, CampaignService campaignService, CallHistoryService callHistoryService, VoiceLiveConfig voiceLiveConfig, GeminiLiveConfig geminiLiveConfig, FreeSwitchService freeSwitchService, SentimentAnalysisService? sentimentService = null, EmotionAnalysisService? emotionService = null, OperatorStyleAnalysisService? operatorStyleService = null, CallSummaryService? callSummaryService = null, SettingsService? settingsService = null)
+        public CallService(IConfiguration configuration, ILogger<CallService> logger, IHubContext<TranscriptHub> hubContext, CampaignService campaignService, CallHistoryService callHistoryService, VoiceLiveConfig voiceLiveConfig, GeminiLiveConfig geminiLiveConfig, FreeSwitchService freeSwitchService, SentimentAnalysisService? sentimentService = null, EmotionAnalysisService? emotionService = null, OperatorStyleAnalysisService? operatorStyleService = null, CallSummaryService? callSummaryService = null, SettingsService? settingsService = null, AzureTtsService? ttsService = null)
         {
             _logger = logger;
             _configuration = configuration;
@@ -46,6 +47,7 @@ namespace ContactCenterPOC.Services
             _voiceLiveConfig = voiceLiveConfig;
             _geminiLiveConfig = geminiLiveConfig;
             _freeSwitchService = freeSwitchService;
+            _ttsService = ttsService;
             _callbackUri = configuration["CallbackUrl"] ?? throw new InvalidOperationException("CallbackUrl not configured");
 
             // Wire up FreeSWITCH ESL events for call lifecycle
@@ -383,7 +385,7 @@ namespace ContactCenterPOC.Services
                 _sentimentService, _activeCalls, _emotionService, selectedVoice,
                 voiceApiMode, voiceLiveModel, voiceLiveVoice, _voiceLiveConfig,
                 _geminiLiveConfig, geminiLiveVoice,
-                _freeSwitchService);
+                _freeSwitchService, _ttsService);
             _mediaHandlers[callConnectionId] = handler;
 
             try

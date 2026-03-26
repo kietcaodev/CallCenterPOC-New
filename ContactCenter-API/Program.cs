@@ -114,6 +114,11 @@ builder.Services.AddHttpClient("AzureOpenAITranscription", client =>
 {
     client.Timeout = TimeSpan.FromMinutes(10);
 });
+builder.Services.AddHttpClient("AzureTts", client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(30);
+});
+builder.Services.AddSingleton<AzureTtsService>();
 builder.Services.AddSingleton<RecordingTranscriptionService>();
 builder.Services.AddControllers();
 // Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle

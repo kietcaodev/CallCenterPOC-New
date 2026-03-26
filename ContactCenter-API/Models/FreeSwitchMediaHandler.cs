@@ -40,6 +40,7 @@ namespace ContactCenterPOC.Models
         private readonly GeminiLiveConfig? _geminiLiveConfig;
         private readonly string? _geminiLiveVoice;
         private readonly FreeSwitchService? _freeSwitchService;
+        private readonly AzureTtsService? _ttsService;
 
         // Serialize WebSocket writes (reads and writes are independent but
         // concurrent writes on the same WebSocket are not thread-safe).
@@ -76,7 +77,8 @@ namespace ContactCenterPOC.Models
             VoiceLiveConfig? voiceLiveConfig = null,
             GeminiLiveConfig? geminiLiveConfig = null,
             string? geminiLiveVoice = null,
-            FreeSwitchService? freeSwitchService = null)
+            FreeSwitchService? freeSwitchService = null,
+            AzureTtsService? ttsService = null)
         {
             _webSocket = webSocket;
             _configuration = configuration;
@@ -97,6 +99,7 @@ namespace ContactCenterPOC.Models
             _geminiLiveConfig = geminiLiveConfig;
             _geminiLiveVoice = geminiLiveVoice;
             _freeSwitchService = freeSwitchService;
+            _ttsService = ttsService;
         }
 
         /// <summary>
@@ -162,7 +165,7 @@ namespace ContactCenterPOC.Models
                 _aiServiceHandler = new AzureOpenAIService(
                     this, callContextPrompt, _configuration, _logger, _hubContext,
                     _callConnectionId, _hangUpCallback, _sentimentService, _activeCalls,
-                    _emotionService, _selectedVoice);
+                    _emotionService, _selectedVoice, _ttsService);
 
                 try
                 {
@@ -279,6 +282,29 @@ namespace ContactCenterPOC.Models
         {
             _aiIsSpeaking = false;
             _log.Info("[PLAY] AI response finished — mic unmuted");
+        }
+
+        /// <summary>
+        /// Feeds a complete TTS audio blob (raw PCM16 mono at 16 kHz) directly into the
+        /// jitter buffer that was started by NotifyAiResponseStarted().
+        /// No resampling is applied — bytes go straight into the channel as-is.
+        /// The pre-buffer phase will be satisfied immediately since the entire audio is
+        /// enqueued at once; the drainer then paces out 20ms slices at the correct rate.
+        /// </summary>
+        public Task FeedPcm16AudioAsync(byte[] pcm16_16kHz)
+        {
+            if (_audioChannel == null || pcm16_16kHz == null || pcm16_16kHz.Length == 0)
+                return Task.CompletedTask;
+
+            _totalChunksSent++;
+            _totalBytesSent += pcm16_16kHz.Length;
+            _log.Info("[PLAY] [TTS] FeedPcm16: {Bytes}B ({Ms}ms audio) → jitter buffer",
+                pcm16_16kHz.Length, pcm16_16kHz.Length / 32);  // 16kHz PCM16 = 32 bytes/ms
+
+            // Write the entire TTS blob as a single chunk.
+            // The jitter buffer drainer will slice it into 20ms (640B) pieces.
+            _audioChannel.Writer.TryWrite(pcm16_16kHz);
+            return Task.CompletedTask;
         }
 
         /// <summary>
