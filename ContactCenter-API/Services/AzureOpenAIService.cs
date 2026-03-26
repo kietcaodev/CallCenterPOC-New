@@ -40,6 +40,10 @@ namespace ContactCenterPOC.Services
         private readonly AzureTtsService? _ttsService;
         private string? _pendingTtsText;
 
+        // Tracks whether the model currently has an active response in-flight.
+        // Used to guard CancelResponseAsync so we never call it after a response finishes.
+        private volatile bool _responseInProgress = false;
+
         public AzureOpenAIService(
             IMediaStreamingHandler mediaStreaming,
             IConfiguration configuration,
@@ -253,6 +257,7 @@ namespace ContactCenterPOC.Services
                     {
                         _log.Info("Begin streaming of new item");
                         _pendingTtsText = null; // reset per-turn text buffer
+                        _responseInProgress = true;
                         if (_ttsService == null)
                             m_mediaStreaming.NotifyAiResponseStarted(); // immediate for native audio mode
                         // TTS mode: defer NotifyAiResponseStarted until TTS audio is ready
@@ -332,17 +337,28 @@ namespace ContactCenterPOC.Services
                         {
                             _log.Info("Filtered hallucinated transcript: {Transcript}", transcriptionCompletedUpdate.Transcript);
                             // Cancel any in-progress AI response triggered by this hallucinated audio.
-                            // The Realtime API generates a response before transcription arrives,
-                            // so we must explicitly cancel it here.
-                            try
+                            // Guard with _responseInProgress: Whisper transcription arrives AFTER
+                            // ConversationResponseFinishedUpdate in TTS mode (TTS synthesis takes ~1s),
+                            // so by the time we get here the response may already be complete.
+                            // Calling CancelResponseAsync with no active response causes Azure to
+                            // send a ConversationErrorUpdate that was previously killing the session.
+                            if (_responseInProgress)
                             {
-                                await m_aiSession.CancelResponseAsync();
-                                _log.Info("Cancelled AI response triggered by hallucinated audio");
-                                m_mediaStreaming.NotifyAiResponseFinished();
+                                try
+                                {
+                                    _responseInProgress = false;
+                                    await m_aiSession.CancelResponseAsync();
+                                    _log.Info("Cancelled AI response triggered by hallucinated audio");
+                                    m_mediaStreaming.NotifyAiResponseFinished();
+                                }
+                                catch (Exception ex)
+                                {
+                                    _log.Warn(ex, "Failed to cancel response for hallucinated transcript (may already be finished)");
+                                }
                             }
-                            catch (Exception ex)
+                            else
                             {
-                                _log.Warn(ex, "Failed to cancel response for hallucinated transcript (may already be finished)");
+                                _log.Info("Hallucination detected but no active response to cancel — ignoring");
                             }
                             continue;
                         }
@@ -407,11 +423,26 @@ namespace ContactCenterPOC.Services
                             await m_mediaStreaming.FlushAudioAsync();
                             m_mediaStreaming.NotifyAiResponseFinished();
                         }
+                        _responseInProgress = false; // response fully complete
                     }
 
                     if (update is ConversationErrorUpdate errorUpdate)
                     {
-                        _log.Error("OpenAI Realtime error: {ErrorMessage}", errorUpdate.Message);
+                        // Non-fatal errors (e.g. "Cancellation failed: no active response found")
+                        // must NOT kill the session or hang up — just log as warning and continue.
+                        var msg = errorUpdate.Message ?? "";
+                        var isNonFatal =
+                            msg.Contains("no active response", StringComparison.OrdinalIgnoreCase) ||
+                            msg.Contains("Cancellation failed", StringComparison.OrdinalIgnoreCase) ||
+                            msg.Contains("no response", StringComparison.OrdinalIgnoreCase);
+
+                        if (isNonFatal)
+                        {
+                            _log.Warn("Non-fatal OpenAI Realtime error (ignored): {ErrorMessage}", msg);
+                            continue;
+                        }
+
+                        _log.Error("Fatal OpenAI Realtime error: {ErrorMessage}", msg);
                         if (_hangUpCallback != null)
                         {
                             await _hangUpCallback(_callConnectionId);
