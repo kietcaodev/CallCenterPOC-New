@@ -474,67 +474,93 @@ namespace ContactCenterPOC.Models
         /// </summary>
         private async Task SendJitteredAsync(ChannelReader<byte[]> reader, CancellationToken ct)
         {
-            const int kBytesPerSlice = 640; // 20ms @ 16kHz PCM16: 16000*2/50 = 640
-            const int kIntervalMs = 20;
+            const int kBytesPerSlice = 640;  // 20ms @ 16kHz PCM16
+            const int kIntervalMs    = 20;
 
-            // Pre-allocated silence frame (all zeros = PCM silence)
+            // PRE-BUFFER target: accumulate this many bytes before starting playback.
+            // 3 AI chunks ≈ 2×12800 + 6400 = ~38400B ≈ 1.2s audio → enough headroom to
+            // survive the bursty inter-chunk gaps OpenAI sends. Adds ~300ms initial latency.
+            const int kPreBufferTargetBytes = 38400;
+            // Max time to wait while pre-buffering (if AI is slow to respond)
+            const int kPreBufferTimeoutMs   = 800;
+            // When underrun happens, wait this long for new data before sending silence
+            const int kUnderrunWaitMs       = 60;
+
             var silence = new byte[kBytesPerSlice];
-
-            // Rolling accumulator of bytes waiting to be sliced
-            var acc = new List<byte>(kBytesPerSlice * 200);
-            int accPos = 0;
-            int silencesSent = 0;
+            var acc     = new List<byte>(kBytesPerSlice * 300);
+            int accPos  = 0;
+            int silencesSent     = 0;
+            int totalSilenceMs   = 0;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
 
             void AppendChunk(byte[] chunk)
             {
-                // Compact before appending if we've consumed a lot
-                if (accPos > kBytesPerSlice * 50)
-                {
-                    acc.RemoveRange(0, accPos);
-                    accPos = 0;
-                }
+                if (accPos > kBytesPerSlice * 50) { acc.RemoveRange(0, accPos); accPos = 0; }
                 acc.AddRange(chunk);
             }
 
             try
             {
-                // PRE-BUFFER: Wait for the first real chunk before starting the 20ms clock.
-                // This eliminates initial silence packets that cause a jarring "two voices" effect
-                // (mod_audio_fork hears: silence burst → abrupt voice start).
-                // Block here up to 500ms; if nothing arrives, fall through to normal loop.
-                _log.Info("[JITTER] Pre-buffering: waiting for first audio chunk...");
-                try
-                {
-                    using var preCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                    preCts.CancelAfter(500);
-                    if (await reader.WaitToReadAsync(preCts.Token))
-                    {
-                        while (reader.TryRead(out var seed))
-                            AppendChunk(seed);
-                        _log.Info("[JITTER] Pre-buffer ready: {Bytes}B buffered before first slice", acc.Count - accPos);
-                    }
-                }
-                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-                {
-                    // 500ms timeout — no data arrived, fall through to normal loop
-                    _log.Warn("[JITTER] Pre-buffer timeout: no audio arrived in 500ms");
-                }
+                // ── PHASE 1: PRE-BUFFER ──────────────────────────────────────────────────
+                // Keep pulling chunks until we hit the target or the timeout expires.
+                _log.Info("[JITTER] Pre-buffer start: target={TargetKB:F1}KB, timeout={TimeoutMs}ms",
+                    kPreBufferTargetBytes / 1024.0, kPreBufferTimeoutMs);
+
+                var preDeadline = DateTime.UtcNow.AddMilliseconds(kPreBufferTimeoutMs);
+                int chunksReceived = 0;
 
                 while (!ct.IsCancellationRequested && !_bargeIn)
                 {
-                    // Pull all immediately available chunks into accumulator (non-blocking)
-                    while (reader.TryRead(out var newChunk))
-                        AppendChunk(newChunk);
+                    int available = acc.Count - accPos;
+                    if (available >= kPreBufferTargetBytes)
+                    {
+                        _log.Info("[JITTER] Pre-buffer FULL: {Bytes}B in {Chunks} chunk(s) after {ElapsedMs}ms — starting playback",
+                            available, chunksReceived, sw.ElapsedMilliseconds);
+                        break;
+                    }
+                    if (DateTime.UtcNow >= preDeadline)
+                    {
+                        _log.Info("[JITTER] Pre-buffer TIMEOUT after {ElapsedMs}ms: {Bytes}B / {TargetBytes}B in {Chunks} chunk(s) — starting anyway",
+                            sw.ElapsedMilliseconds, available, kPreBufferTargetBytes, chunksReceived);
+                        break;
+                    }
+                    if (reader.Completion.IsCompleted)
+                    {
+                        _log.Info("[JITTER] Pre-buffer: channel completed early with {Bytes}B — starting flush",
+                            available);
+                        break;
+                    }
+
+                    // Wait for next chunk (up to remaining pre-buffer window)
+                    var remaining = (int)(preDeadline - DateTime.UtcNow).TotalMilliseconds;
+                    if (remaining <= 0) break;
+                    using var preCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    preCts.CancelAfter(remaining);
+                    try
+                    {
+                        if (await reader.WaitToReadAsync(preCts.Token))
+                        {
+                            while (reader.TryRead(out var seed)) { AppendChunk(seed); chunksReceived++; }
+                        }
+                    }
+                    catch (OperationCanceledException) when (!ct.IsCancellationRequested) { break; }
+                }
+
+                // ── PHASE 2: STEADY DRAIN ────────────────────────────────────────────────
+                while (!ct.IsCancellationRequested && !_bargeIn)
+                {
+                    while (reader.TryRead(out var newChunk)) AppendChunk(newChunk);
 
                     int available = acc.Count - accPos;
 
                     if (available >= kBytesPerSlice)
                     {
-                        // We have real audio data — send one slice
                         if (silencesSent > 0)
                         {
-                            _log.Info("[JITTER] Resumed real audio after {Count} silence packet(s)", silencesSent);
-                            silencesSent = 0;
+                            _log.Info("[JITTER] Resumed real audio after {Count} silence packet(s) ({Ms}ms gap)",
+                                silencesSent, totalSilenceMs);
+                            silencesSent   = 0;
+                            totalSilenceMs = 0;
                         }
 
                         var slice = new byte[kBytesPerSlice];
@@ -543,14 +569,14 @@ namespace ContactCenterPOC.Models
 
                         _jitterSlicesSent++;
                         if (_jitterSlicesSent <= 10 || _jitterSlicesSent % 100 == 0)
-                            _log.Info("[JITTER] slice#{Slice}: {Bytes}B sent to mod_audio_fork", _jitterSlicesSent, slice.Length);
+                            _log.Info("[JITTER] slice#{Slice}: bufferAhead={AheadKB:F1}KB remaining",
+                                _jitterSlicesSent, (acc.Count - accPos) / 1024.0);
 
                         await SendBinaryDirectAsync(slice, ct);
                         await Task.Delay(kIntervalMs, ct);
                     }
                     else if (reader.Completion.IsCompleted)
                     {
-                        // Channel done and no more full slices — flush any tail bytes and exit
                         if (available > 0 && !_bargeIn)
                         {
                             var tail = acc.Skip(accPos).ToArray();
@@ -561,23 +587,30 @@ namespace ContactCenterPOC.Models
                     }
                     else
                     {
-                        // Buffer underrun: AI chunk not arrived yet.
-                        // Send silence to maintain 20ms pacing — prevents mod_audio_fork underflow.
+                        // Underrun: wait a bit for data before sending silence
+                        using var waitCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                        waitCts.CancelAfter(kUnderrunWaitMs);
+                        try { await reader.WaitToReadAsync(waitCts.Token); }
+                        catch (OperationCanceledException) when (!ct.IsCancellationRequested) { }
+
+                        // Check again after waiting
+                        while (reader.TryRead(out var lateChunk)) AppendChunk(lateChunk);
+                        if (acc.Count - accPos >= kBytesPerSlice) continue; // got data, no silence needed
+
+                        // Still empty → send silence
                         silencesSent++;
-                        if (silencesSent <= 3 || silencesSent % 25 == 0)
-                            _log.Warn("[JITTER] Buffer underrun #{Count} — sending silence to prevent stutter", silencesSent);
+                        totalSilenceMs += kIntervalMs;
+                        if (silencesSent == 1 || silencesSent % 10 == 0)
+                            _log.Warn("[JITTER] Underrun #{Count} ({TotalMs}ms gap) — sending silence; elapsed={ElapsedMs}ms",
+                                silencesSent, totalSilenceMs, sw.ElapsedMilliseconds);
 
                         await SendBinaryDirectAsync(silence, ct);
-
-                        // Wait up to 20ms for new data, then loop (may send more silence or real audio)
-                        using var delayCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                        delayCts.CancelAfter(kIntervalMs);
-                        try { await reader.WaitToReadAsync(delayCts.Token); }
-                        catch (OperationCanceledException) { /* timeout is expected */ }
+                        await Task.Delay(kIntervalMs, ct);
                     }
                 }
 
-                _log.Info("[JITTER] Drainer complete. Total slices sent={Slices}, barge-in={BargeIn}", _jitterSlicesSent, _bargeIn);
+                _log.Info("[JITTER] Drainer complete: slices={Slices}, barge-in={BargeIn}, total-silence={SilenceMs}ms, elapsed={ElapsedMs}ms",
+                    _jitterSlicesSent, _bargeIn, totalSilenceMs, sw.ElapsedMilliseconds);
             }
             catch (OperationCanceledException) { }
             catch (Exception ex)
