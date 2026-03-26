@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.SignalR;
 using OpenAI.RealtimeConversation;
 using System.ClientModel;
 using System.Collections.Concurrent;
+using System.Threading.Channels;
 
 
 namespace ContactCenterPOC.Services
@@ -38,7 +39,15 @@ namespace ContactCenterPOC.Services
 
         // TTS mode: when set, GPT audio output is ignored and text is fed to Azure TTS instead.
         private readonly AzureTtsService? _ttsService;
-        private string? _pendingTtsText;
+
+        // Streaming TTS pipeline:
+        //   AI text deltas → sentence splitter → TTS tasks (parallel) → ordered playback
+        // Each turn gets a fresh pipeline; sentences are fired as soon as a boundary is detected
+        // so TTS latency overlaps with GPT generation rather than waiting for the full response.
+        private readonly System.Text.StringBuilder _ttsSentenceBuffer = new();
+        private Channel<Task<byte[]?>>? _ttsChunkChannel;  // tasks enqueued in order
+        private Task? _ttsPlaybackTask;                    // consumer: awaits each task, feeds PCM
+        private int _ttsChunkIndex = 0;
 
         // Tracks whether the model currently has an active response in-flight.
         // Used to guard CancelResponseAsync so we never call it after a response finishes.
@@ -256,11 +265,20 @@ namespace ContactCenterPOC.Services
                     if (update is ConversationItemStreamingStartedUpdate itemStartedUpdate)
                     {
                         _log.Info("Begin streaming of new item");
-                        _pendingTtsText = null; // reset per-turn text buffer
                         _responseInProgress = true;
-                        if (_ttsService == null)
+                        if (_ttsService != null)
+                        {
+                            // TTS mode: start fresh pipeline for this turn
+                            _ttsSentenceBuffer.Clear();
+                            _ttsChunkIndex = 0;
+                            _ttsChunkChannel = Channel.CreateUnbounded<Task<byte[]?>>(
+                                new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
+                            _ttsPlaybackTask = PlayTtsChunksInOrderAsync(_ttsChunkChannel.Reader, m_cts.Token);
+                        }
+                        else
+                        {
                             m_mediaStreaming.NotifyAiResponseStarted(); // immediate for native audio mode
-                        // TTS mode: defer NotifyAiResponseStarted until TTS audio is ready
+                        }
                     }
 
                     // Audio transcript updates contain the incremental text matching the generated
@@ -268,9 +286,6 @@ namespace ContactCenterPOC.Services
                     if (update is ConversationItemStreamingAudioTranscriptionFinishedUpdate outputTranscriptDeltaUpdate)
                     {
                         _log.Info("AI transcript: {Transcript}", outputTranscriptDeltaUpdate.Transcript);
-                        // Save for TTS synthesis on response-finished event
-                        if (_ttsService != null)
-                            _pendingTtsText = outputTranscriptDeltaUpdate.Transcript;
                         var aiEntry = new TranscriptEntry
                         {
                             CallConnectionId = _callConnectionId,
@@ -298,28 +313,38 @@ namespace ContactCenterPOC.Services
                     // audio, matching the output audio format configured for the session.
                     if (update is ConversationItemStreamingPartDeltaUpdate deltaUpdate)
                     {
-                        if (deltaUpdate.AudioBytes != null)
+                        if (_ttsService != null && _ttsChunkChannel != null)
                         {
-                            if (_ttsService != null)
+                            // TTS mode: accumulate transcript text deltas; fire TTS per sentence
+                            var transcriptDelta = deltaUpdate.AudioTranscript;
+                            if (!string.IsNullOrEmpty(transcriptDelta))
                             {
-                                // TTS mode: discard GPT audio — text transcript collected separately
-                                audioChunkCount++; // still count for logging
-                            }
-                            else
-                            {
+                                _ttsSentenceBuffer.Append(transcriptDelta);
                                 audioChunkCount++;
-                                if (audioChunkCount <= 3 || audioChunkCount % 50 == 0)
+
+                                // Fire TTS for each complete sentence found in the buffer
+                                while (TryExtractSentence(_ttsSentenceBuffer, out var sentence))
                                 {
-                                    _log.Info("Sending audio chunk #{ChunkNum} ({ByteCount} bytes) to ACS", 
-                                        audioChunkCount, deltaUpdate.AudioBytes.ToArray().Length);
+                                    var idx = ++_ttsChunkIndex;
+                                    var capturedSentence = sentence;
+                                    _log.Info("[TTS] chunk#{Idx} queued: '{Text}'", idx, capturedSentence);
+                                    // Fire TTS call immediately (runs in parallel)
+                                    var ttsTask = _ttsService.SynthesizeAsync(capturedSentence, null, m_cts.Token);
+                                    _ttsChunkChannel.Writer.TryWrite(ttsTask);
                                 }
-                                var jsonString = MediaStreamingData.GetAudioDataForOutbound(deltaUpdate.AudioBytes.ToArray());
-                                await m_mediaStreaming.SendMessageAsync(jsonString);
                             }
                         }
-                        else
+                        else if (deltaUpdate.AudioBytes != null)
                         {
-                            _log.Debug("Received text-only delta (no audio bytes)");
+                            // Native audio mode
+                            audioChunkCount++;
+                            if (audioChunkCount <= 3 || audioChunkCount % 50 == 0)
+                            {
+                                _log.Info("Sending audio chunk #{ChunkNum} ({ByteCount} bytes) to ACS", 
+                                    audioChunkCount, deltaUpdate.AudioBytes.ToArray().Length);
+                            }
+                            var jsonString = MediaStreamingData.GetAudioDataForOutbound(deltaUpdate.AudioBytes.ToArray());
+                            await m_mediaStreaming.SendMessageAsync(jsonString);
                         }
                     }
 
@@ -349,7 +374,11 @@ namespace ContactCenterPOC.Services
                                     _responseInProgress = false;
                                     await m_aiSession.CancelResponseAsync();
                                     _log.Info("Cancelled AI response triggered by hallucinated audio");
-                                    m_mediaStreaming.NotifyAiResponseFinished();
+                                    // TTS mode: ConversationResponseFinishedUpdate(cancelled) will
+                                    // close the TTS channel + await playback + call NotifyAiResponseFinished.
+                                    // Native audio mode: notify immediately.
+                                    if (_ttsService == null)
+                                        m_mediaStreaming.NotifyAiResponseFinished();
                                 }
                                 catch (Exception ex)
                                 {
@@ -391,38 +420,40 @@ namespace ContactCenterPOC.Services
                         _log.Info("Model turn generation finished. Status: {Status}. Total audio chunks (GPT): {ChunkCount}", 
                             turnFinishedUpdate.Status, audioChunkCount);
 
-                        if (_ttsService != null)
+                        if (_ttsService != null && _ttsChunkChannel != null)
                         {
-                            // TTS mode: synthesize accumulated AI text and play via jitter buffer
-                            var textToSpeak = _pendingTtsText;
-                            if (!string.IsNullOrWhiteSpace(textToSpeak) && turnFinishedUpdate.Status != ConversationStatus.Cancelled)
+                            if (turnFinishedUpdate.Status != ConversationStatus.Cancelled)
                             {
-                                _log.Info("[TTS] Synthesizing {Chars} chars...", textToSpeak.Length);
-                                var pcmBytes = await _ttsService.SynthesizeAsync(textToSpeak, null, m_cts.Token);
-                                if (pcmBytes != null && pcmBytes.Length > 0)
+                                // Flush any remaining partial sentence (no sentence boundary at end)
+                                var tail = _ttsSentenceBuffer.ToString().Trim();
+                                if (!string.IsNullOrWhiteSpace(tail))
                                 {
-                                    m_mediaStreaming.NotifyAiResponseStarted();
-                                    await m_mediaStreaming.FeedPcm16AudioAsync(pcmBytes);
-                                    await m_mediaStreaming.FlushAudioAsync();
+                                    var idx = ++_ttsChunkIndex;
+                                    _log.Info("[TTS] chunk#{Idx} tail queued: '{Text}'", idx, tail);
+                                    var ttsTask = _ttsService.SynthesizeAsync(tail, null, m_cts.Token);
+                                    _ttsChunkChannel.Writer.TryWrite(ttsTask);
                                 }
-                                else
-                                {
-                                    _log.Warn("[TTS] Synthesis returned empty — skipping playback");
-                                }
+                                _ttsSentenceBuffer.Clear();
                             }
-                            else
+
+                            // Signal no more chunks; wait for ordered playback to finish
+                            _ttsChunkChannel.Writer.TryComplete();
+                            if (_ttsPlaybackTask != null)
                             {
-                                _log.Info("[TTS] No text to speak (status={Status}, text='{Text}')",
-                                    turnFinishedUpdate.Status, textToSpeak ?? "(null)");
+                                try { await _ttsPlaybackTask; }
+                                catch (OperationCanceledException) { }
+                                catch (Exception ex) { _log.Warn(ex, "[TTS] Playback task faulted"); }
                             }
-                            m_mediaStreaming.NotifyAiResponseFinished();
+
+                            // Drain jitter buffer and unmute
+                            await m_mediaStreaming.FlushAudioAsync();
                         }
-                        else
+                        else if (_ttsService == null)
                         {
                             // Native audio mode: flush jitter buffer and unmute
                             await m_mediaStreaming.FlushAudioAsync();
-                            m_mediaStreaming.NotifyAiResponseFinished();
                         }
+                        m_mediaStreaming.NotifyAiResponseFinished();
                         _responseInProgress = false; // response fully complete
                     }
 
@@ -484,6 +515,78 @@ namespace ContactCenterPOC.Services
                     }
                 }
             }
+        }
+
+        /// <summary>
+        /// Consumes TTS tasks from the channel in order, awaiting each result and feeding
+        /// PCM bytes into the jitter buffer sequentially.
+        /// Calls NotifyAiResponseStarted() before the first non-empty chunk so the jitter
+        /// buffer is created at the right moment (not speculatively before TTS returns).
+        /// </summary>
+        private async Task PlayTtsChunksInOrderAsync(
+            ChannelReader<Task<byte[]?>> reader,
+            CancellationToken ct)
+        {
+            bool audioStarted = false;
+            try
+            {
+                await foreach (var ttsTask in reader.ReadAllAsync(ct))
+                {
+                    byte[]? pcm;
+                    try { pcm = await ttsTask; }
+                    catch (Exception ex)
+                    {
+                        _log.Warn(ex, "[TTS] Chunk synthesis failed — skipping");
+                        continue;
+                    }
+
+                    if (pcm == null || pcm.Length == 0)
+                    {
+                        _log.Warn("[TTS] Chunk returned empty PCM — skipping");
+                        continue;
+                    }
+
+                    if (!audioStarted)
+                    {
+                        m_mediaStreaming.NotifyAiResponseStarted();
+                        audioStarted = true;
+                    }
+
+                    await m_mediaStreaming.FeedPcm16AudioAsync(pcm);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                _log.Error(ex, "[TTS] PlayTtsChunksInOrderAsync exception");
+            }
+        }
+
+        /// <summary>
+        /// Extracts the next complete sentence from <paramref name="sb"/>.
+        /// A sentence ends at `. `, `! `, `? ` (or the same punctuation before \n/\r).
+        /// Minimum 6 characters to avoid false splits on abbreviations like "Mr. ".
+        /// Returns false when no complete sentence is found yet.
+        /// </summary>
+        private static bool TryExtractSentence(System.Text.StringBuilder sb, out string sentence)
+        {
+            sentence = "";
+            if (sb.Length < 6) return false;
+
+            var text = sb.ToString();
+            for (int i = 5; i < text.Length - 1; i++)
+            {
+                char c    = text[i];
+                char next = text[i + 1];
+                if ((c == '.' || c == '!' || c == '?') &&
+                    (next == ' ' || next == '\n' || next == '\r'))
+                {
+                    sentence = text[..(i + 1)].Trim();
+                    sb.Remove(0, i + 2);
+                    return !string.IsNullOrWhiteSpace(sentence);
+                }
+            }
+            return false;
         }
 
         private async Task<bool> TryReconnectAsync()
