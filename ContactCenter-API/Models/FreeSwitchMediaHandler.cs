@@ -5,6 +5,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net.WebSockets;
 using System.Text;
+using System.Threading.Channels;
 
 namespace ContactCenterPOC.Models
 {
@@ -46,13 +47,17 @@ namespace ContactCenterPOC.Models
 
         private volatile bool _bargeIn = false;
 
+        // --- Jitter buffer: smooths OpenAI's bursty audio delivery ---
+        // AI sends 400ms chunks unevenly; we slice to 20ms and send at fixed rate.
+        private Channel<byte[]>? _audioChannel;
+        private Task? _drainerTask;
+        private volatile bool _aiIsSpeaking = false;
+
         // --- Debug counters ---
         private int _totalChunksSent = 0;
         private int _totalBytesSent = 0;
         private int _bargeInSkippedChunks = 0;
-
-        // For chunk-interval timing
-        private long _lastSendTimestamp = 0;
+        private int _jitterSlicesSent = 0;
 
         public FreeSwitchMediaHandler(
             WebSocket webSocket,
@@ -203,60 +208,20 @@ namespace ContactCenterPOC.Models
                 var audioBytes = ExtractAudioFromAcsJson(acsJsonMessage);
                 if (audioBytes != null && audioBytes.Length > 0)
                 {
-                    // Downsample from 24kHz to 16kHz to match mod_audio_fork's desired sampling rate
+                    // Downsample from 24kHz to 16kHz to match mod_audio_fork
                     var downsampled = AudioResampler.Downsample24kTo16k(audioBytes);
 
-                    // --- DEBUG: measure lock-wait time to detect backpressure ---
-                    var lockWaitStart = Stopwatch.GetTimestamp();
-                    await _sendLock.WaitAsync(_cts.Token);
-                    var lockWaitMs = (Stopwatch.GetTimestamp() - lockWaitStart) * 1000.0 / Stopwatch.Frequency;
+                    _totalChunksSent++;
+                    _totalBytesSent += downsampled.Length;
 
-                    try
+                    if (_totalChunksSent <= 10 || _totalChunksSent % 50 == 0)
                     {
-                        if (_webSocket?.State == WebSocketState.Open)
-                        {
-                            // --- DEBUG: measure actual WebSocket send time ---
-                            var sendStart = Stopwatch.GetTimestamp();
-                            await _webSocket.SendAsync(
-                                new ArraySegment<byte>(downsampled),
-                                WebSocketMessageType.Binary,
-                                true,
-                                _cts.Token);
-                            var sendMs = (Stopwatch.GetTimestamp() - sendStart) * 1000.0 / Stopwatch.Frequency;
-
-                            // --- DEBUG: measure interval between consecutive chunks ---
-                            double intervalMs = 0;
-                            var now = Stopwatch.GetTimestamp();
-                            if (_lastSendTimestamp != 0)
-                                intervalMs = (now - _lastSendTimestamp) * 1000.0 / Stopwatch.Frequency;
-                            _lastSendTimestamp = now;
-
-                            _totalChunksSent++;
-                            _totalBytesSent += downsampled.Length;
-
-                            // Log first 10 chunks in detail, then every 50
-                            if (_totalChunksSent <= 10 || _totalChunksSent % 50 == 0)
-                            {
-                                _log.Info("[PLAY] chunk#{Chunk}: 24k={RawB}B→16k={DownB}B | lockWait={LockMs:F1}ms | sendTime={SendMs:F1}ms | interval={IntervalMs:F1}ms | total={TotalKB:F1}KB",
-                                    _totalChunksSent, audioBytes.Length, downsampled.Length,
-                                    lockWaitMs, sendMs, intervalMs, _totalBytesSent / 1024.0);
-                            }
-                            else if (lockWaitMs > 30)
-                            {
-                                _log.Warn("[PLAY] chunk#{Chunk}: HIGH lockWait={LockMs:F1}ms (possible backpressure!)",
-                                    _totalChunksSent, lockWaitMs);
-                            }
-                            else if (sendMs > 50)
-                            {
-                                _log.Warn("[PLAY] chunk#{Chunk}: SLOW WebSocket send={SendMs:F1}ms",
-                                    _totalChunksSent, sendMs);
-                            }
-                        }
+                        _log.Info("[PLAY] Enqueue chunk#{Chunk}: 24k={RawB}B→16k={DownB}B | total enqueued={TotalKB:F1}KB",
+                            _totalChunksSent, audioBytes.Length, downsampled.Length, _totalBytesSent / 1024.0);
                     }
-                    finally
-                    {
-                        _sendLock.Release();
-                    }
+
+                    // Write to jitter buffer channel; drainer sends at steady 20ms rate
+                    _audioChannel?.Writer.TryWrite(downsampled);
                 }
             }
             catch (OperationCanceledException) { }
@@ -267,14 +232,26 @@ namespace ContactCenterPOC.Models
         }
 
         /// <summary>
-        /// Flush any remaining audio. With direct binary streaming, this is a no-op
-        /// since each chunk is sent immediately.
+        /// Signal end-of-turn: complete the jitter buffer channel and wait for the drainer
+        /// to finish flushing all remaining 20ms slices before signalling finished.
         /// </summary>
-        public Task FlushAudioAsync()
+        public async Task FlushAudioAsync()
         {
-            _log.Info("[PLAY] AI turn complete. Total chunks sent={Chunks}, totalBytes={TotalKB:F1}KB",
+            _log.Info("[PLAY] FlushAudioAsync: completing jitter channel. Enqueued chunks={Chunks}, enqueued bytes={TotalKB:F1}KB",
                 _totalChunksSent, _totalBytesSent / 1024.0);
-            return Task.CompletedTask;
+
+            _audioChannel?.Writer.TryComplete();
+
+            if (_drainerTask != null)
+            {
+                try { await _drainerTask.ConfigureAwait(false); }
+                catch (OperationCanceledException) { }
+                catch (Exception ex) { _log.Warn(ex, "[PLAY] Drainer task faulted during flush"); }
+            }
+
+            _log.Info("[PLAY] FlushAudioAsync done. Jitter slices sent={Slices}", _jitterSlicesSent);
+            _audioChannel = null;
+            _drainerTask = null;
         }
 
         /// <summary>
@@ -283,16 +260,26 @@ namespace ContactCenterPOC.Models
         /// </summary>
         public void NotifyAiResponseStarted()
         {
-            _log.Info("[PLAY] AI response started — resetting bargeIn flag (was skipping {Skipped} chunks)", _bargeInSkippedChunks);
+            _log.Info("[PLAY] AI response started — resetting bargeIn (was skipping {Skipped} chunks). Creating jitter buffer.",
+                _bargeInSkippedChunks);
             _bargeInSkippedChunks = 0;
-            _lastSendTimestamp = 0;
+            _totalChunksSent = 0;
+            _totalBytesSent = 0;
+            _jitterSlicesSent = 0;
             _bargeIn = false;
+            _aiIsSpeaking = true;
+
+            // Create a fresh channel for this response turn
+            _audioChannel = Channel.CreateUnbounded<byte[]>(
+                new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+            _drainerTask = Task.Run(() => SendJitteredAsync(_audioChannel.Reader, _cts.Token));
         }
 
-        /// <summary>
-        /// Called by AI service when model finishes generating a response.
-        /// </summary>
-        public void NotifyAiResponseFinished() { }
+        public void NotifyAiResponseFinished()
+        {
+            _aiIsSpeaking = false;
+            _log.Info("[PLAY] AI response finished — mic unmuted");
+        }
 
         /// <summary>
         /// Handle barge-in: send killAudio to mod_audio_fork to clear its receive buffer
@@ -301,6 +288,10 @@ namespace ContactCenterPOC.Models
         private async Task HandleBargeInAsync()
         {
             _bargeIn = true;
+            _aiIsSpeaking = false; // Unmute mic immediately so user speech is forwarded
+
+            // Stop the jitter buffer drainer; discard remaining buffered audio
+            _audioChannel?.Writer.TryComplete();
 
             // Send killAudio JSON text message to mod_audio_fork
             var killAudioJson = Encoding.UTF8.GetBytes("{\"type\":\"killAudio\"}");
@@ -322,7 +313,7 @@ namespace ContactCenterPOC.Models
                 _sendLock.Release();
             }
 
-            _log.Info("Barge-in: sent killAudio to mod_audio_fork");
+            _log.Info("[BARGE-IN] Sent killAudio to mod_audio_fork; jitter buffer aborted; mic unmuted");
         }
 
         private static bool IsStopAudioMessage(string json)
@@ -417,13 +408,21 @@ namespace ContactCenterPOC.Models
                             var audioData = messageBuffer.ToArray();
                             messageBuffer.SetLength(0);
 
-                            // Always forward real mic audio to AI — full-duplex mode.
-                            // User can speak while bot is playing. AI server-side VAD
-                            // handles barge-in detection.
+                            // Mute mic while AI is speaking to prevent echo from triggering
+                            // false VAD and hallucinated transcriptions in Whisper.
+                            if (_aiIsSpeaking)
+                            {
+                                // Count muted frames but don't forward
+                                forwardedCount++;
+                                if (forwardedCount <= 5 || forwardedCount % 500 == 0)
+                                    _log.Info("[MIC] Muted during AI speech. frameCount={Count}", forwardedCount);
+                                continue;
+                            }
+
                             var resampled = AudioResampler.Upsample16kTo24k(audioData);
                             forwardedCount++;
 
-                            // Log first 5 chunks to verify raw chunk sizes from FreeSWITCH
+                            // Log first 5 chunks and every 250 thereafter
                             if (forwardedCount <= 5 || forwardedCount % 250 == 0)
                             {
                                 _log.Info("[MIC] chunk#{Count}: raw={RawB}B (16kHz) -> resampled={ResampledB}B (24kHz) | forwarded={Fwd}",
@@ -464,6 +463,106 @@ namespace ContactCenterPOC.Models
             catch (Exception ex)
             {
                 _log.Error(ex, "Error in FreeSWITCH receive loop");
+            }
+        }
+
+        /// <summary>
+        /// Jitter buffer drainer: reads downsampled 16kHz PCM bytes from the channel,
+        /// slices into 640-byte (20ms) pieces and sends each with a 20ms delay.
+        /// This smooths OpenAI's bursty chunk delivery into a steady stream so
+        /// mod_audio_fork never over-fills or under-flows its playout buffer.
+        /// </summary>
+        private async Task SendJitteredAsync(ChannelReader<byte[]> reader, CancellationToken ct)
+        {
+            const int kBytesPerSlice = 640; // 20ms @ 16kHz PCM16: 16000*2/50 = 640
+            const int kIntervalMs = 20;
+
+            // Rolling accumulator of bytes waiting to be sliced
+            var acc = new MemoryStream();
+
+            try
+            {
+                await foreach (var chunk in reader.ReadAllAsync(ct))
+                {
+                    if (_bargeIn) break; // abort on barge-in; discard remaining buffer
+
+                    // Append to accumulator
+                    acc.Seek(0, SeekOrigin.End);
+                    await acc.WriteAsync(chunk, ct);
+                    acc.Position = 0;
+
+                    // Drain as many 20ms slices as possible
+                    while (acc.Length - acc.Position >= kBytesPerSlice)
+                    {
+                        if (_bargeIn || ct.IsCancellationRequested) goto done;
+
+                        var slice = new byte[kBytesPerSlice];
+                        _ = await acc.ReadAsync(slice, ct);
+
+                        _jitterSlicesSent++;
+                        if (_jitterSlicesSent <= 10 || _jitterSlicesSent % 100 == 0)
+                            _log.Info("[JITTER] slice#{Slice}: {Bytes}B sent to mod_audio_fork", _jitterSlicesSent, slice.Length);
+
+                        await SendBinaryDirectAsync(slice, ct);
+                        await Task.Delay(kIntervalMs, ct);
+                    }
+
+                    // Compact the accumulator — shift remaining bytes to front
+                    var remaining = (int)(acc.Length - acc.Position);
+                    if (remaining > 0)
+                    {
+                        var leftover = new byte[remaining];
+                        _ = await acc.ReadAsync(leftover, ct);
+                        acc.SetLength(0);
+                        acc.Position = 0;
+                        await acc.WriteAsync(leftover, ct);
+                    }
+                    else
+                    {
+                        acc.SetLength(0);
+                        acc.Position = 0;
+                    }
+                }
+
+                // Flush any leftover bytes not aligned to 640
+                acc.Position = 0;
+                if (acc.Length > 0 && !_bargeIn && !ct.IsCancellationRequested)
+                {
+                    var tail = acc.ToArray();
+                    _log.Info("[JITTER] Flushing tail {Bytes}B", tail.Length);
+                    await SendBinaryDirectAsync(tail, ct);
+                }
+
+                done:
+                _log.Info("[JITTER] Drainer complete. Total slices sent={Slices}, barge-in={BargeIn}", _jitterSlicesSent, _bargeIn);
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                _log.Error(ex, "[JITTER] Drainer exception");
+            }
+        }
+
+        /// <summary>
+        /// Low-level binary send to WebSocket (bypasses jitter queue, thread-safe via _sendLock).
+        /// </summary>
+        private async Task SendBinaryDirectAsync(byte[] data, CancellationToken ct)
+        {
+            await _sendLock.WaitAsync(ct);
+            try
+            {
+                if (_webSocket?.State == WebSocketState.Open)
+                {
+                    var sendStart = Stopwatch.GetTimestamp();
+                    await _webSocket.SendAsync(new ArraySegment<byte>(data), WebSocketMessageType.Binary, true, ct);
+                    var sendMs = (Stopwatch.GetTimestamp() - sendStart) * 1000.0 / Stopwatch.Frequency;
+                    if (sendMs > 30)
+                        _log.Warn("[JITTER] SLOW WebSocket send: {SendMs:F1}ms for {Bytes}B slice", sendMs, data.Length);
+                }
+            }
+            finally
+            {
+                _sendLock.Release();
             }
         }
 

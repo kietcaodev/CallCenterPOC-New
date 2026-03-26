@@ -19,6 +19,8 @@ public static class WhisperHallucinationFilter
     private static readonly string[] HallucinationFragments =
     [
         "hẹn gặp lại",
+        "hẹn mọi người",           // seen in logs: "HẸN MỌI NGƯỜI MỚI THÂN THƯƠNG"
+        "thân thương",              // YouTube outro phrase
         "đăng ký kênh",
         "đăng kí kênh",
         "nhớ đăng ký",
@@ -43,6 +45,9 @@ public static class WhisperHallucinationFilter
         "theo dõi kênh",
         "phụ đề",
         "sub việt",
+        "hẹn các bạn",             // "Hẹn các bạn trong video sau"
+        "gặp lại các bạn",
+        "hẹn gặp",
     ];
 
     // Regex patterns for more complex hallucination detection
