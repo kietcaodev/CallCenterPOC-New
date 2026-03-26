@@ -547,6 +547,13 @@ namespace ContactCenterPOC.Models
                 }
 
                 // ── PHASE 2: STEADY DRAIN ────────────────────────────────────────────────
+                // Use an adaptive clock: track wall-clock since drain start,
+                // compute the ideal next-slice deadline, and sleep only the remainder.
+                // This compensates for Task.Delay imprecision (~1-5ms drift per slice on Windows)
+                // which otherwise causes audio to play 5-15% slower than real-time.
+                var drainSw = System.Diagnostics.Stopwatch.StartNew();
+                long drainSliceCount = 0; // number of slices (real + silence) dispatched
+
                 while (!ct.IsCancellationRequested && !_bargeIn)
                 {
                     while (reader.TryRead(out var newChunk)) AppendChunk(newChunk);
@@ -573,7 +580,14 @@ namespace ContactCenterPOC.Models
                                 _jitterSlicesSent, (acc.Count - accPos) / 1024.0);
 
                         await SendBinaryDirectAsync(slice, ct);
-                        await Task.Delay(kIntervalMs, ct);
+
+                        // Adaptive sleep: sleep only what is left until the next 20ms boundary
+                        drainSliceCount++;
+                        long expectedMs = drainSliceCount * kIntervalMs;
+                        long actualMs   = drainSw.ElapsedMilliseconds;
+                        int  delayMs    = (int)(expectedMs - actualMs);
+                        if (delayMs > 1)
+                            await Task.Delay(delayMs, ct);
                     }
                     else if (reader.Completion.IsCompleted)
                     {
@@ -605,12 +619,22 @@ namespace ContactCenterPOC.Models
                                 silencesSent, totalSilenceMs, sw.ElapsedMilliseconds);
 
                         await SendBinaryDirectAsync(silence, ct);
-                        await Task.Delay(kIntervalMs, ct);
+
+                        // Adaptive sleep for silence slices too
+                        drainSliceCount++;
+                        long expectedMsS = drainSliceCount * kIntervalMs;
+                        long actualMsS   = drainSw.ElapsedMilliseconds;
+                        int  delaySMs    = (int)(expectedMsS - actualMsS);
+                        if (delaySMs > 1)
+                            await Task.Delay(delaySMs, ct);
                     }
                 }
 
-                _log.Info("[JITTER] Drainer complete: slices={Slices}, barge-in={BargeIn}, total-silence={SilenceMs}ms, elapsed={ElapsedMs}ms",
-                    _jitterSlicesSent, _bargeIn, totalSilenceMs, sw.ElapsedMilliseconds);
+                long expectedTotalMs = drainSliceCount * kIntervalMs;
+                long actualTotalMs   = drainSw.ElapsedMilliseconds;
+                long driftMs         = actualTotalMs - expectedTotalMs;
+                _log.Info("[JITTER] Drainer complete: slices={Slices}, barge-in={BargeIn}, total-silence={SilenceMs}ms, elapsed={ElapsedMs}ms, drift={DriftMs}ms",
+                    _jitterSlicesSent, _bargeIn, totalSilenceMs, sw.ElapsedMilliseconds, driftMs);
             }
             catch (OperationCanceledException) { }
             catch (Exception ex)
