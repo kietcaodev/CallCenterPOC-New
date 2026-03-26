@@ -74,33 +74,60 @@ namespace ContactCenterPOC.Services
                         _logger.LogInformation("No local campaigns file found, loading defaults");
                         _campaigns = GetDefaultCampaigns();
                         await SaveCampaignsAsync();
+                        return;
                     }
-                    return;
-                }
-
-                var containerClient = _blobServiceClient.GetBlobContainerClient(_containerName);
-                await containerClient.CreateIfNotExistsAsync();
-                var blobClient = containerClient.GetBlobClient(_blobName);
-
-                if (await blobClient.ExistsAsync())
-                {
-                    var response = await blobClient.DownloadContentAsync();
-                    var json = response.Value.Content.ToString();
-                    _campaigns = JsonSerializer.Deserialize<List<Campaign>>(json, _readOptions) ?? new List<Campaign>();
-                    _logger.LogInformation("Loaded {Count} campaigns from Blob Storage", _campaigns.Count);
                 }
                 else
                 {
-                    _logger.LogInformation("No campaigns blob found, loading defaults");
-                    _campaigns = GetDefaultCampaigns();
-                    await SaveCampaignsAsync();
+                    var containerClient = _blobServiceClient.GetBlobContainerClient(_containerName);
+                    await containerClient.CreateIfNotExistsAsync();
+                    var blobClient = containerClient.GetBlobClient(_blobName);
+
+                    if (await blobClient.ExistsAsync())
+                    {
+                        var response = await blobClient.DownloadContentAsync();
+                        var json = response.Value.Content.ToString();
+                        _campaigns = JsonSerializer.Deserialize<List<Campaign>>(json, _readOptions) ?? new List<Campaign>();
+                        _logger.LogInformation("Loaded {Count} campaigns from Blob Storage", _campaigns.Count);
+                    }
+                    else
+                    {
+                        _logger.LogInformation("No campaigns blob found, loading defaults");
+                        _campaigns = GetDefaultCampaigns();
+                        await SaveCampaignsAsync();
+                        return;
+                    }
                 }
+
+                // Merge any default campaigns that are missing from the existing list.
+                // This ensures newly added default campaigns appear automatically on next startup.
+                await MergeDefaultCampaignsAsync();
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Failed to load campaigns from Blob Storage, using defaults");
+                _logger.LogWarning(ex, "Failed to load campaigns from storage, using defaults");
                 _campaigns = GetDefaultCampaigns();
             }
+        }
+
+        /// <summary>
+        /// Compares loaded campaigns against defaults and inserts any that are missing (by Title).
+        /// Saves back to storage if any were added.
+        /// </summary>
+        private async Task MergeDefaultCampaignsAsync()
+        {
+            var defaults = GetDefaultCampaigns();
+            var existingTitles = new HashSet<string>(_campaigns.Select(c => c.Title), StringComparer.OrdinalIgnoreCase);
+            var missing = defaults.Where(d => !existingTitles.Contains(d.Title)).ToList();
+
+            if (missing.Count == 0) return;
+
+            _logger.LogInformation("Merging {Count} new default campaign(s): {Titles}",
+                missing.Count, string.Join(", ", missing.Select(m => m.Title)));
+
+            // Prepend so new defaults appear at the top
+            _campaigns.InsertRange(0, missing);
+            await SaveCampaignsAsync();
         }
 
         private async Task SaveCampaignsAsync()
