@@ -211,7 +211,26 @@ namespace ContactCenterPOC.Services
                 """);
             await session.SendCommandAsync(langUpdate, null);
 
-            _log.Info("Session configured (voice={Voice}, format=PCM16, VAD enabled, lang=vi)", _selectedVoice);
+            // TTS mode: request text-only output so GPT skips its audio encoder.
+            // Text tokens arrive token-by-token (~300-500ms sooner than audio-transcript deltas),
+            // letting the sentence pipeline fire TTS requests earlier → lower TTFT.
+            if (_ttsService != null)
+            {
+                var textOnlyUpdate = BinaryData.FromString("""
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "modalities": ["text"]
+                        }
+                    }
+                    """);
+                await session.SendCommandAsync(textOnlyUpdate, null);
+                _log.Info("Session configured (TTS mode: modalities=text, Azure TTS handles audio output)");
+            }
+            else
+            {
+                _log.Info("Session configured (voice={Voice}, format=PCM16, VAD enabled, lang=vi)", _selectedVoice);
+            }
             return session;
         }
 
@@ -315,8 +334,9 @@ namespace ContactCenterPOC.Services
                     {
                         if (_ttsService != null && _ttsChunkChannel != null)
                         {
-                            // TTS mode: accumulate transcript text deltas; fire TTS per sentence
-                            var transcriptDelta = deltaUpdate.AudioTranscript;
+                            // TTS mode: use deltaUpdate.Text — text-only modality streams token-by-token
+                            // (much earlier & more granular than AudioTranscript which aligns to audio frames)
+                            var transcriptDelta = deltaUpdate.Text ?? deltaUpdate.AudioTranscript;
                             if (!string.IsNullOrEmpty(transcriptDelta))
                             {
                                 _ttsSentenceBuffer.Append(transcriptDelta);
@@ -350,7 +370,26 @@ namespace ContactCenterPOC.Services
 
                     if (update is ConversationItemStreamingTextFinishedUpdate itemFinishedUpdate)
                     {
-                        _log.Info("Item streaming finished, response_id={ResponseId}", itemFinishedUpdate.ResponseId);
+                        _log.Info("Item streaming text finished, response_id={ResponseId}", itemFinishedUpdate.ResponseId);
+                        // In TTS (text-only) mode, ConversationItemStreamingAudioTranscriptionFinishedUpdate
+                        // never fires. Use this event to log the AI transcript and update the UI/analysis.
+                        if (_ttsService != null && !string.IsNullOrWhiteSpace(itemFinishedUpdate.Text))
+                        {
+                            _log.Info("AI transcript (text-only mode): {Transcript}", itemFinishedUpdate.Text);
+                            var aiEntry = new TranscriptEntry
+                            {
+                                CallConnectionId = _callConnectionId,
+                                Speaker = SpeakerType.AI,
+                                Text = itemFinishedUpdate.Text,
+                                Timestamp = DateTimeOffset.UtcNow
+                            };
+                            if (_activeCalls != null && _activeCalls.TryGetValue(_callConnectionId, out var activeCall3))
+                                activeCall3.TranscriptEntries.Add(aiEntry);
+                            await _hubContext.Clients.Group(_callConnectionId)
+                                .SendAsync("TranscriptUpdate", aiEntry);
+                            FireAndForgetSentiment(aiEntry);
+                            FireAndForgetEmotion(aiEntry);
+                        }
                     }
 
                     if (update is ConversationInputTranscriptionFinishedUpdate transcriptionCompletedUpdate)
