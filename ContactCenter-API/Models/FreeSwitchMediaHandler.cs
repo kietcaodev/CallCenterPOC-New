@@ -42,6 +42,12 @@ namespace ContactCenterPOC.Models
         private readonly FreeSwitchService? _freeSwitchService;
         private readonly AzureTtsService? _ttsService;
 
+        // Output sample rate for audio sent BACK to FreeSWITCH via WebSocket binary frames.
+        // Must match the FreeSWITCH channel's write_rate:
+        //   16000 = SIP wideband (default)
+        //   8000  = PSTN/PCMU — mod_audio_fork does NOT resample return audio automatically.
+        private readonly int _outputSampleRate;
+
         // Serialize WebSocket writes (reads and writes are independent but
         // concurrent writes on the same WebSocket are not thread-safe).
         private readonly SemaphoreSlim _sendLock = new(1, 1);
@@ -78,7 +84,8 @@ namespace ContactCenterPOC.Models
             GeminiLiveConfig? geminiLiveConfig = null,
             string? geminiLiveVoice = null,
             FreeSwitchService? freeSwitchService = null,
-            AzureTtsService? ttsService = null)
+            AzureTtsService? ttsService = null,
+            int outputSampleRate = 16000)
         {
             _webSocket = webSocket;
             _configuration = configuration;
@@ -100,6 +107,11 @@ namespace ContactCenterPOC.Models
             _geminiLiveVoice = geminiLiveVoice;
             _freeSwitchService = freeSwitchService;
             _ttsService = ttsService;
+            // 16000 = SIP wideband (send as-is); 8000 = PSTN PCMU (must downsample 16k→8k).
+            // mod_audio_fork always forks audio to us at 16kHz (per dialplan '16k'),
+            // but it does NOT auto-resample audio we send BACK — we must match channel rate.
+            _outputSampleRate = (outputSampleRate == 8000) ? 8000 : 16000;
+            _log.Info("Output sample rate: {Rate}Hz", _outputSampleRate);
         }
 
         /// <summary>
@@ -211,16 +223,26 @@ namespace ContactCenterPOC.Models
                 var audioBytes = ExtractAudioFromAcsJson(acsJsonMessage);
                 if (audioBytes != null && audioBytes.Length > 0)
                 {
-                    // Downsample from 24kHz to 16kHz to match mod_audio_fork
-                    var downsampled = AudioResampler.Downsample24kTo16k(audioBytes);
+                    // Downsample from 24kHz to target output rate
+                    byte[] downsampled;
+                    if (_outputSampleRate == 8000)
+                    {
+                        // PSTN: 24kHz → 8kHz (channel write_rate = PCMU 8kHz)
+                        downsampled = AudioResampler.Resample(audioBytes, 24000, 8000);
+                    }
+                    else
+                    {
+                        // SIP wideband: 24kHz → 16kHz
+                        downsampled = AudioResampler.Downsample24kTo16k(audioBytes);
+                    }
 
                     _totalChunksSent++;
                     _totalBytesSent += downsampled.Length;
 
                     if (_totalChunksSent <= 10 || _totalChunksSent % 50 == 0)
                     {
-                        _log.Info("[PLAY] Enqueue chunk#{Chunk}: 24k={RawB}B→16k={DownB}B | total enqueued={TotalKB:F1}KB",
-                            _totalChunksSent, audioBytes.Length, downsampled.Length, _totalBytesSent / 1024.0);
+                        _log.Info("[PLAY] Enqueue chunk#{Chunk}: 24k={RawB}B→{OutRate}k={DownB}B | total enqueued={TotalKB:F1}KB",
+                            _totalChunksSent, audioBytes.Length, _outputSampleRate / 1000, downsampled.Length, _totalBytesSent / 1024.0);
                     }
 
                     // Write to jitter buffer channel; drainer sends at steady 20ms rate
@@ -296,14 +318,24 @@ namespace ContactCenterPOC.Models
             if (_audioChannel == null || pcm16_16kHz == null || pcm16_16kHz.Length == 0)
                 return Task.CompletedTask;
 
-            _totalChunksSent++;
-            _totalBytesSent += pcm16_16kHz.Length;
-            _log.Info("[PLAY] [TTS] FeedPcm16: {Bytes}B ({Ms}ms audio) → jitter buffer",
-                pcm16_16kHz.Length, pcm16_16kHz.Length / 32);  // 16kHz PCM16 = 32 bytes/ms
+            // If PSTN (8kHz output), downsample the TTS audio (16kHz) before feeding the jitter buffer.
+            // The jitter buffer slice size is already 320B (8kHz 20ms) for PSTN calls.
+            byte[] pcmOut;
+            if (_outputSampleRate == 8000)
+            {
+                pcmOut = AudioResampler.Resample(pcm16_16kHz, 16000, 8000);
+            }
+            else
+            {
+                pcmOut = pcm16_16kHz;
+            }
 
-            // Write the entire TTS blob as a single chunk.
-            // The jitter buffer drainer will slice it into 20ms (640B) pieces.
-            _audioChannel.Writer.TryWrite(pcm16_16kHz);
+            _totalChunksSent++;
+            _totalBytesSent += pcmOut.Length;
+            _log.Info("[PLAY] [TTS] FeedPcm16: {InBytes}B (16kHz) → {OutBytes}B ({OutRate}Hz, {Ms}ms audio) → jitter buffer",
+                pcm16_16kHz.Length, pcmOut.Length, _outputSampleRate, pcmOut.Length / (_outputSampleRate / 1000 * 2));  // bytes ÷ (samples/ms * 2 bytes)
+
+            _audioChannel.Writer.TryWrite(pcmOut);
             return Task.CompletedTask;
         }
 
@@ -500,13 +532,15 @@ namespace ContactCenterPOC.Models
         /// </summary>
         private async Task SendJitteredAsync(ChannelReader<byte[]> reader, CancellationToken ct)
         {
-            const int kBytesPerSlice = 640;  // 20ms @ 16kHz PCM16
+            // Slice size: 20ms of PCM16 at the output sample rate.
+            //   16kHz: 16000 samples/s × 0.020s × 2 bytes = 640 bytes
+            //   8kHz:   8000 samples/s × 0.020s × 2 bytes = 320 bytes
+            int kBytesPerSlice = (_outputSampleRate == 8000) ? 320 : 640;
             const int kIntervalMs    = 20;
 
-            // PRE-BUFFER target: accumulate this many bytes before starting playback.
-            // ~5 AI chunks ≈ 64000B ≈ 2s audio → enough headroom to survive 1s inter-chunk gaps.
-            // Adds ~600ms initial latency but eliminates mid-stream stutter.
-            const int kPreBufferTargetBytes = 64000;
+            // PRE-BUFFER target: accumulate ~2s of audio before starting playback.
+            // 16kHz PCM16: 16000*2*2s = 64000B; 8kHz PCM16: 8000*2*2s = 32000B.
+            int kPreBufferTargetBytes = kBytesPerSlice * 100;  // 100 slices × 20ms = 2s
             // Max time to wait while pre-buffering (if AI is slow to respond)
             const int kPreBufferTimeoutMs   = 1200;
             // When underrun happens, wait this long for new data before sending silence

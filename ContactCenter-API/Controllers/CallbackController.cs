@@ -33,6 +33,9 @@ namespace ContactCenterPOC.Controllers
         ///   calledNumber - callee phone number (optional)  
         ///   campaignId   - campaign to use for AI prompt (optional)
         ///   contactName  - name of the contact (optional)
+        ///   outputRate   - sample rate for audio sent BACK to FreeSWITCH (default 16000).
+        ///                  Set to 8000 for PSTN/PCMU calls so mod_audio_fork gets 8kHz PCM.
+        ///                  Example: &amp;outputRate=8000
         /// </summary>
         [HttpGet("ws")]
         public async Task<IActionResult> Get(
@@ -40,7 +43,8 @@ namespace ContactCenterPOC.Controllers
             [FromQuery] string? callerNumber,
             [FromQuery] string? calledNumber,
             [FromQuery] string? campaignId,
-            [FromQuery] string? contactName)
+            [FromQuery] string? contactName,
+            [FromQuery] int outputRate = 16000)
         {
             if (!HttpContext.WebSockets.IsWebSocketRequest)
             {
@@ -56,7 +60,7 @@ namespace ContactCenterPOC.Controllers
                 effectiveCallId, callerNumber, calledNumber, campaignId);
 
             await _callService.StartCallInteraction(
-                HttpContext, effectiveCallId, callerNumber, calledNumber, campaignId, contactName);
+                HttpContext, effectiveCallId, callerNumber, calledNumber, campaignId, contactName, outputRate);
 
             return new EmptyResult();
         }

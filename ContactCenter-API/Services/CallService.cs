@@ -294,7 +294,8 @@ namespace ContactCenterPOC.Services
         public async Task StartCallInteraction(
             HttpContext httpContext, string callId,
             string? callerNumber = null, string? calledNumber = null,
-            string? campaignId = null, string? contactName = null)
+            string? campaignId = null, string? contactName = null,
+            int outputRate = 16000)
         {
             if (!httpContext.WebSockets.IsWebSocketRequest)
             {
@@ -385,7 +386,7 @@ namespace ContactCenterPOC.Services
                 _sentimentService, _activeCalls, _emotionService, selectedVoice,
                 voiceApiMode, voiceLiveModel, voiceLiveVoice, _voiceLiveConfig,
                 _geminiLiveConfig, geminiLiveVoice,
-                _freeSwitchService, _ttsService);
+                _freeSwitchService, _ttsService, outputRate);
             _mediaHandlers[callConnectionId] = handler;
 
             try
