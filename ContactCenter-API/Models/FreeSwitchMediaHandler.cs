@@ -498,6 +498,28 @@ namespace ContactCenterPOC.Models
 
             try
             {
+                // PRE-BUFFER: Wait for the first real chunk before starting the 20ms clock.
+                // This eliminates initial silence packets that cause a jarring "two voices" effect
+                // (mod_audio_fork hears: silence burst → abrupt voice start).
+                // Block here up to 500ms; if nothing arrives, fall through to normal loop.
+                _log.Info("[JITTER] Pre-buffering: waiting for first audio chunk...");
+                try
+                {
+                    using var preCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    preCts.CancelAfter(500);
+                    if (await reader.WaitToReadAsync(preCts.Token))
+                    {
+                        while (reader.TryRead(out var seed))
+                            AppendChunk(seed);
+                        _log.Info("[JITTER] Pre-buffer ready: {Bytes}B buffered before first slice", acc.Count - accPos);
+                    }
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    // 500ms timeout — no data arrived, fall through to normal loop
+                    _log.Warn("[JITTER] Pre-buffer timeout: no audio arrived in 500ms");
+                }
+
                 while (!ct.IsCancellationRequested && !_bargeIn)
                 {
                     // Pull all immediately available chunks into accumulator (non-blocking)
