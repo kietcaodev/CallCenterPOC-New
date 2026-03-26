@@ -2,6 +2,7 @@ using ContactCenterPOC.Hubs;
 using ContactCenterPOC.Services;
 using Microsoft.AspNetCore.SignalR;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net.WebSockets;
 using System.Text;
 
@@ -48,6 +49,10 @@ namespace ContactCenterPOC.Models
         // --- Debug counters ---
         private int _totalChunksSent = 0;
         private int _totalBytesSent = 0;
+        private int _bargeInSkippedChunks = 0;
+
+        // For chunk-interval timing
+        private long _lastSendTimestamp = 0;
 
         public FreeSwitchMediaHandler(
             WebSocket webSocket,
@@ -187,7 +192,13 @@ namespace ContactCenterPOC.Models
                     return;
                 }
 
-                if (_bargeIn) return; // Skip audio while barge-in is active
+                if (_bargeIn)
+                {
+                    _bargeInSkippedChunks++;
+                    if (_bargeInSkippedChunks == 1 || _bargeInSkippedChunks % 50 == 0)
+                        _log.Info("[PLAY] BargeIn active — skipped {SkippedChunks} chunk(s)", _bargeInSkippedChunks);
+                    return;
+                }
 
                 var audioBytes = ExtractAudioFromAcsJson(acsJsonMessage);
                 if (audioBytes != null && audioBytes.Length > 0)
@@ -195,24 +206,50 @@ namespace ContactCenterPOC.Models
                     // Downsample from 24kHz to 16kHz to match mod_audio_fork's desired sampling rate
                     var downsampled = AudioResampler.Downsample24kTo16k(audioBytes);
 
+                    // --- DEBUG: measure lock-wait time to detect backpressure ---
+                    var lockWaitStart = Stopwatch.GetTimestamp();
                     await _sendLock.WaitAsync(_cts.Token);
+                    var lockWaitMs = (Stopwatch.GetTimestamp() - lockWaitStart) * 1000.0 / Stopwatch.Frequency;
+
                     try
                     {
                         if (_webSocket?.State == WebSocketState.Open)
                         {
+                            // --- DEBUG: measure actual WebSocket send time ---
+                            var sendStart = Stopwatch.GetTimestamp();
                             await _webSocket.SendAsync(
                                 new ArraySegment<byte>(downsampled),
                                 WebSocketMessageType.Binary,
                                 true,
                                 _cts.Token);
+                            var sendMs = (Stopwatch.GetTimestamp() - sendStart) * 1000.0 / Stopwatch.Frequency;
+
+                            // --- DEBUG: measure interval between consecutive chunks ---
+                            double intervalMs = 0;
+                            var now = Stopwatch.GetTimestamp();
+                            if (_lastSendTimestamp != 0)
+                                intervalMs = (now - _lastSendTimestamp) * 1000.0 / Stopwatch.Frequency;
+                            _lastSendTimestamp = now;
 
                             _totalChunksSent++;
                             _totalBytesSent += downsampled.Length;
 
-                            if (_totalChunksSent == 1 || _totalChunksSent % 100 == 0)
+                            // Log first 10 chunks in detail, then every 50
+                            if (_totalChunksSent <= 10 || _totalChunksSent % 50 == 0)
                             {
-                                _log.Info("[PLAY] Sent {Chunks} audio chunks ({TotalKB:F1}KB) to mod_audio_fork",
-                                    _totalChunksSent, _totalBytesSent / 1024.0);
+                                _log.Info("[PLAY] chunk#{Chunk}: 24k={RawB}B→16k={DownB}B | lockWait={LockMs:F1}ms | sendTime={SendMs:F1}ms | interval={IntervalMs:F1}ms | total={TotalKB:F1}KB",
+                                    _totalChunksSent, audioBytes.Length, downsampled.Length,
+                                    lockWaitMs, sendMs, intervalMs, _totalBytesSent / 1024.0);
+                            }
+                            else if (lockWaitMs > 30)
+                            {
+                                _log.Warn("[PLAY] chunk#{Chunk}: HIGH lockWait={LockMs:F1}ms (possible backpressure!)",
+                                    _totalChunksSent, lockWaitMs);
+                            }
+                            else if (sendMs > 50)
+                            {
+                                _log.Warn("[PLAY] chunk#{Chunk}: SLOW WebSocket send={SendMs:F1}ms",
+                                    _totalChunksSent, sendMs);
                             }
                         }
                     }
@@ -246,6 +283,9 @@ namespace ContactCenterPOC.Models
         /// </summary>
         public void NotifyAiResponseStarted()
         {
+            _log.Info("[PLAY] AI response started — resetting bargeIn flag (was skipping {Skipped} chunks)", _bargeInSkippedChunks);
+            _bargeInSkippedChunks = 0;
+            _lastSendTimestamp = 0;
             _bargeIn = false;
         }
 
@@ -382,10 +422,12 @@ namespace ContactCenterPOC.Models
                             // handles barge-in detection.
                             var resampled = AudioResampler.Upsample16kTo24k(audioData);
                             forwardedCount++;
-                            if (forwardedCount == 1 || forwardedCount % 250 == 0)
+
+                            // Log first 5 chunks to verify raw chunk sizes from FreeSWITCH
+                            if (forwardedCount <= 5 || forwardedCount % 250 == 0)
                             {
-                                _log.Info("Audio stats: forwarded={Forwarded}",
-                                    forwardedCount);
+                                _log.Info("[MIC] chunk#{Count}: raw={RawB}B (16kHz) -> resampled={ResampledB}B (24kHz) | forwarded={Fwd}",
+                                    messageCount, audioData.Length, resampled.Length, forwardedCount);
                             }
 
                             using var ms = new MemoryStream(resampled);

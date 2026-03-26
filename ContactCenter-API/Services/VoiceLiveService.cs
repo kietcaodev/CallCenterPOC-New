@@ -158,11 +158,18 @@ namespace ContactCenterPOC.Services
                     }
 
                     // User barge-in: speech started
-                    if (update is SessionUpdateInputAudioBufferSpeechStarted speechStarted)
+                    if (update is SessionUpdateInputAudioBufferSpeechStarted)
                     {
-                        _log.Info("Voice activity detection started");
+                        _log.Info("[VAD] SpeechStarted — AI was on audioDelta#{Chunk} when barge-in fired",
+                            audioChunkCount);
                         var jsonString = MediaStreamingData.GetStopAudioForOutbound();
                         await m_mediaStreaming.SendMessageAsync(jsonString);
+                    }
+
+                    // User VAD: speech stopped — helps diagnose false triggers
+                    if (update is SessionUpdateInputAudioBufferSpeechStopped)
+                    {
+                        _log.Info("[VAD] SpeechStopped (will trigger transcription)");
                     }
 
                     // AI audio output delta
@@ -175,12 +182,16 @@ namespace ContactCenterPOC.Services
                             {
                                 m_mediaStreaming.NotifyAiResponseStarted();
                             }
-                            if (audioChunkCount <= 3 || audioChunkCount % 50 == 0)
-                            {
-                                _log.Info("Sending audio chunk #{ChunkNum} to ACS",
-                                    audioChunkCount);
-                            }
+
                             var audioBytes = audioDelta.Delta.ToArray();
+
+                            // Log first 10 chunks in detail to diagnose choppy playback
+                            if (audioChunkCount <= 10 || audioChunkCount % 50 == 0)
+                            {
+                                _log.Info("[PLAY] audioDelta#{ChunkNum}: {Bytes}B (24kHz PCM)",
+                                    audioChunkCount, audioBytes.Length);
+                            }
+
                             var jsonString = MediaStreamingData.GetAudioDataForOutbound(audioBytes);
                             await m_mediaStreaming.SendMessageAsync(jsonString);
                         }
@@ -222,12 +233,16 @@ namespace ContactCenterPOC.Services
                     // User transcript completed
                     if (update is SessionUpdateConversationItemInputAudioTranscriptionCompleted userTranscript)
                     {
+                        // Log BEFORE filter so we see everything Whisper produces
+                        _log.Info("[TRANSCRIPT-RAW] User transcript from Whisper: '{Transcript}' (len={Len}, audioDeltaContext={ChunkCount})",
+                            userTranscript.Transcript, userTranscript.Transcript?.Length ?? 0, audioChunkCount);
+
                         _log.Info("User audio transcript: {Transcript}", userTranscript.Transcript);
 
                         // Filter out Whisper hallucinations (YouTube outro phrases etc.)
                         if (WhisperHallucinationFilter.IsHallucination(userTranscript.Transcript))
                         {
-                            _log.Info("Filtered hallucinated transcript: {Transcript}", userTranscript.Transcript);
+                            _log.Info("[TRANSCRIPT-FILTER] Hallucination filtered: '{Transcript}'", userTranscript.Transcript);
                             continue;
                         }
 
