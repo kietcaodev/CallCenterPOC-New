@@ -307,6 +307,19 @@ namespace ContactCenterPOC.Services
                         if (WhisperHallucinationFilter.IsHallucination(transcriptionCompletedUpdate.Transcript))
                         {
                             _log.Info("Filtered hallucinated transcript: {Transcript}", transcriptionCompletedUpdate.Transcript);
+                            // Cancel any in-progress AI response triggered by this hallucinated audio.
+                            // The Realtime API generates a response before transcription arrives,
+                            // so we must explicitly cancel it here.
+                            try
+                            {
+                                await m_aiSession.CancelResponseAsync();
+                                _log.Info("Cancelled AI response triggered by hallucinated audio");
+                                m_mediaStreaming.NotifyAiResponseFinished();
+                            }
+                            catch (Exception ex)
+                            {
+                                _log.Warn(ex, "Failed to cancel response for hallucinated transcript (may already be finished)");
+                            }
                             continue;
                         }
 
