@@ -11,7 +11,10 @@ namespace ContactCenterPOC.Services
         private const float SentimentLegacyTemperature = 0f;
 
         private const string SentimentSystemPrompt =
-            "You are a sentiment analysis service. Classify the sentiment of the given text as Positive, Neutral, or Negative. " +
+            "You are a sentiment analysis service for a bank call center. " +
+            "The text you receive is a transcript from a customer service call about banking topics " +
+            "(card blocking, account enquiries, loans, etc.). " +
+            "Classify the sentiment as Positive, Neutral, or Negative. " +
             "Respond ONLY with a JSON object: {\"label\":\"Positive|Neutral|Negative\",\"confidence\":0.0-1.0}. " +
             "No other text or explanation.";
 

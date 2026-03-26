@@ -11,8 +11,10 @@ namespace ContactCenterPOC.Services
         private const float EmotionLegacyTemperature = 0f;
 
         private const string EmotionSystemPrompt =
-            "You are an emotion classification service. Classify the emotion of the given text into exactly one of these labels: " +
-            "Neutral, Happy, Frustrated, Angry, Sad, Anxious. " +
+            "You are an emotion classification service for a bank call center. " +
+            "The text you receive is a transcript from a customer service call about banking topics " +
+            "(card blocking, account enquiries, loans, etc.). " +
+            "Classify the emotion into exactly one of these labels: Neutral, Happy, Frustrated, Angry, Sad, Anxious. " +
             "Respond ONLY with a JSON object: {\"label\":\"Neutral|Happy|Frustrated|Angry|Sad|Anxious\",\"confidence\":0.0-1.0}. " +
             "No other text or explanation.";
 

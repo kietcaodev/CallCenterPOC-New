@@ -429,14 +429,19 @@ namespace ContactCenterPOC.Services
                     effectivePrompt = campaign.AiBehaviorInstructions;
                     resolvedCampaignId = campaign.Id;
                     resolvedCampaignTitle = campaign.Title;
+                    _logger.LogInformation("[{CallId}] Using dialplan campaign: {Title} (id={Id})", callId, campaign.Title, campaign.Id);
                 }
                 else
                 {
-                    effectivePrompt = _configuration["AzureOpenAI:SystemPrompt"]
-                        ?? "You are an AI assistant that helps people find information.";
+                    // campaignId not found by exact ID (e.g. dialplan sends "internal-ai" instead of a GUID)
+                    // → fall through to InboundCampaignId from OperatorSettings before giving up
+                    _logger.LogWarning("[{CallId}] campaignId '{CampaignId}' not found — falling back to inbound settings", callId, campaignId);
                 }
             }
-            else
+
+            // If no campaign resolved yet (campaignId null, or campaignId not found above),
+            // apply inbound settings from OperatorSettings
+            if (resolvedCampaignId == null && resolvedCampaignTitle == null)
             {
                 // No campaignId from dialplan — use inbound settings from OperatorSettings
                 var inboundResolved = false;

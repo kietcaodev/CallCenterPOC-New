@@ -478,11 +478,11 @@ namespace ContactCenterPOC.Models
             const int kIntervalMs    = 20;
 
             // PRE-BUFFER target: accumulate this many bytes before starting playback.
-            // 3 AI chunks ≈ 2×12800 + 6400 = ~38400B ≈ 1.2s audio → enough headroom to
-            // survive the bursty inter-chunk gaps OpenAI sends. Adds ~300ms initial latency.
-            const int kPreBufferTargetBytes = 38400;
+            // ~5 AI chunks ≈ 64000B ≈ 2s audio → enough headroom to survive 1s inter-chunk gaps.
+            // Adds ~600ms initial latency but eliminates mid-stream stutter.
+            const int kPreBufferTargetBytes = 64000;
             // Max time to wait while pre-buffering (if AI is slow to respond)
-            const int kPreBufferTimeoutMs   = 800;
+            const int kPreBufferTimeoutMs   = 1200;
             // When underrun happens, wait this long for new data before sending silence
             const int kUnderrunWaitMs       = 60;
 
