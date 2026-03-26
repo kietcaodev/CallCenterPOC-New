@@ -201,10 +201,14 @@ namespace ContactCenterPOC.Services
             return voiceName?.ToLowerInvariant() switch
             {
                 "echo" => ConversationVoice.Echo,
-                "fable" => new ConversationVoice("fable"),
-                "onyx" => new ConversationVoice("onyx"),
-                "nova" => new ConversationVoice("nova"),
                 "shimmer" => ConversationVoice.Shimmer,
+                "ash" => new ConversationVoice("ash"),
+                "ballad" => new ConversationVoice("ballad"),
+                "coral" => new ConversationVoice("coral"),
+                "sage" => new ConversationVoice("sage"),
+                "verse" => new ConversationVoice("verse"),
+                "marin" => new ConversationVoice("marin"),
+                "cedar" => new ConversationVoice("cedar"),
                 _ => ConversationVoice.Alloy
             };
         }

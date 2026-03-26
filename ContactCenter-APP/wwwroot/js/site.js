@@ -153,10 +153,19 @@
             card.className = "campaign-card" + (selectedCampaign && selectedCampaign.id === c.id ? " selected" : "");
             card.setAttribute("data-campaign-id", c.id);
             card.innerHTML =
+                '<div class="campaign-card-top">' +
                 '<span class="category-badge ' + cat.css + '">' + escapeHtml(cat.label) + '</span>' +
+                '<button class="campaign-edit-btn" title="Edit campaign">' +
+                '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="currentColor" viewBox="0 0 16 16">' +
+                '<path d="M12.146.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1 0 .708l-10 10a.5.5 0 0 1-.168.11l-5 2a.5.5 0 0 1-.65-.65l2-5a.5.5 0 0 1 .11-.168zM11.207 2.5 13.5 4.793 14.793 3.5 12.5 1.207zm1.586 3L10.5 3.207 4 9.707V10h.5a.5.5 0 0 1 .5.5v.5h.5a.5.5 0 0 1 .5.5v.5h.293zm-9.761 5.175-.106.106-1.528 3.821 3.821-1.528.106-.106A.5.5 0 0 1 5 12.5V12h-.5a.5.5 0 0 1-.5-.5V11h-.5a.5.5 0 0 1-.468-.325"/>' +
+                '</svg></button></div>' +
                 '<div class="campaign-card-title">' + escapeHtml(c.title) + '</div>' +
                 '<div class="campaign-card-desc">' + escapeHtml(c.description) + '</div>';
             card.onclick = function () { selectCampaign(c); };
+            var editBtn = card.querySelector(".campaign-edit-btn");
+            if (editBtn) {
+                editBtn.addEventListener("click", function (e) { e.stopPropagation(); openPromptEditor(c); });
+            }
             container.appendChild(card);
         });
     }
@@ -1785,21 +1794,10 @@
     // ═══════════════════════════════════════════════════════════
 
     function setupUIToggles() {
-        // Create Campaign toggle
+        // Create Campaign toggle — opens Prompt Editor modal
         var createToggle = document.getElementById("createCampaignToggle");
-        var createForm = document.getElementById("createCampaignForm");
-        var cancelBtn = document.getElementById("cancelCreateCampaign");
-        if (createToggle && createForm) {
-            createToggle.onclick = function () {
-                createForm.classList.toggle("d-none");
-                createToggle.classList.toggle("d-none");
-            };
-        }
-        if (cancelBtn && createForm && createToggle) {
-            cancelBtn.onclick = function () {
-                createForm.classList.add("d-none");
-                createToggle.classList.remove("d-none");
-            };
+        if (createToggle) {
+            createToggle.onclick = function () { openPromptEditor(null); };
         }
 
         // Prompt override toggle
@@ -1817,6 +1815,7 @@
         if (promptInput) {
             promptInput.addEventListener("input", function () {
                 promptManuallyEdited = promptInput.value.trim().length > 0;
+                updatePromptCounter();
             });
         }
 
@@ -2187,7 +2186,7 @@
             // Restore OpenAI voices
             if (voiceSelect) {
                 voiceSelect.innerHTML = "";
-                var openAIVoices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"];
+                var openAIVoices = ["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "marin", "cedar"];
                 openAIVoices.forEach(function (v) {
                     var opt = document.createElement("option");
                     opt.value = v;
@@ -2266,4 +2265,178 @@
                 console.error("Error saving settings:", err);
             });
     };
+
+    // ═══════════════════════════════════════════════════════════
+    // PROMPT EDITOR
+    // ═══════════════════════════════════════════════════════════
+    var _peEditingCampaign = null; // null = "create new" mode
+
+    window.openPromptEditor = function (campaign) {
+        _peEditingCampaign = campaign;
+        document.getElementById("peTitle").value = campaign ? campaign.title : "";
+        document.getElementById("peDescription").value = campaign ? campaign.description : "";
+        document.getElementById("peInstructions").value = campaign ? (campaign.aiBehaviorInstructions || "") : "";
+        document.getElementById("peModalTitle").textContent = campaign ? "Edit Campaign" : "New Campaign";
+        var badge = document.getElementById("peHeaderBadge");
+        if (badge) badge.textContent = campaign ? (campaign.isDefault ? "Default" : "Custom") : "";
+        var deleteBtn = document.getElementById("peDeleteBtn");
+        if (deleteBtn) deleteBtn.classList.toggle("d-none", !campaign);
+        var errEl = document.getElementById("peError");
+        if (errEl) { errEl.textContent = ""; errEl.classList.add("d-none"); }
+        var saveBtn = document.getElementById("savePromptEditorBtn");
+        if (saveBtn) saveBtn._standaloneMode = false;
+        updatePeCounter();
+        document.getElementById("promptEditorOverlay").classList.remove("d-none");
+        setTimeout(function () { document.getElementById("peTitle").focus(); }, 100);
+    };
+
+    window.closePromptEditor = function () {
+        document.getElementById("promptEditorOverlay").classList.add("d-none");
+        _peEditingCampaign = null;
+        var saveBtn = document.getElementById("savePromptEditorBtn");
+        if (saveBtn) saveBtn._standaloneMode = false;
+    };
+
+    window.editSelectedCampaign = function () {
+        if (selectedCampaign) openPromptEditor(selectedCampaign);
+    };
+
+    window.openStandalonePromptEditor = function () {
+        var currentText = (document.getElementById("prompt").value || "").trim();
+        _peEditingCampaign = null;
+        document.getElementById("peTitle").value = "";
+        document.getElementById("peDescription").value = "";
+        document.getElementById("peInstructions").value = currentText;
+        document.getElementById("peModalTitle").textContent = "Edit Prompt Override";
+        var badge = document.getElementById("peHeaderBadge");
+        if (badge) badge.textContent = "Override";
+        var deleteBtn = document.getElementById("peDeleteBtn");
+        if (deleteBtn) deleteBtn.classList.add("d-none");
+        var errEl = document.getElementById("peError");
+        if (errEl) { errEl.textContent = ""; errEl.classList.add("d-none"); }
+        var saveBtn = document.getElementById("savePromptEditorBtn");
+        if (saveBtn) saveBtn._standaloneMode = true;
+        updatePeCounter();
+        document.getElementById("promptEditorOverlay").classList.remove("d-none");
+        setTimeout(function () { document.getElementById("peInstructions").focus(); }, 100);
+    };
+
+    window.savePromptEditor = function () {
+        var saveBtn = document.getElementById("savePromptEditorBtn");
+        // Standalone mode: write back to prompt override textarea
+        if (saveBtn && saveBtn._standaloneMode) {
+            document.getElementById("prompt").value = document.getElementById("peInstructions").value;
+            updatePromptCounter();
+            promptManuallyEdited = document.getElementById("prompt").value.trim().length > 0;
+            closePromptEditor();
+            return;
+        }
+        var title = document.getElementById("peTitle").value.trim();
+        var description = document.getElementById("peDescription").value.trim();
+        var instructions = document.getElementById("peInstructions").value.trim();
+        var errEl = document.getElementById("peError");
+        if (!title || !instructions) {
+            errEl.textContent = "Title and AI Instructions are required.";
+            errEl.classList.remove("d-none");
+            return;
+        }
+        errEl.classList.add("d-none");
+        if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = "Saving..."; }
+        var method = _peEditingCampaign ? "PUT" : "POST";
+        var url = _peEditingCampaign
+            ? apiBaseUrl() + "/api/Campaign/" + _peEditingCampaign.id
+            : apiBaseUrl() + "/api/Campaign";
+        fetch(url, {
+            method: method,
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ title: title, description: description || title, aiBehaviorInstructions: instructions })
+        })
+        .then(function (resp) {
+            if (resp.ok) {
+                closePromptEditor();
+                window.loadCampaigns();
+            } else {
+                return resp.json().then(function (err) { throw new Error(err.message || "Failed to save"); });
+            }
+        })
+        .catch(function (err) {
+            errEl.textContent = err.message;
+            errEl.classList.remove("d-none");
+        })
+        .finally(function () {
+            if (saveBtn) {
+                saveBtn.disabled = false;
+                saveBtn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" fill="currentColor" viewBox="0 0 16 16" class="me-1"><path d="M2 1a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1H9.5a1 1 0 0 0-1 1v7.293l2.646-2.647a.5.5 0 0 1 .708.708l-3.5 3.5a.5.5 0 0 1-.708 0l-3.5-3.5a.5.5 0 1 1 .708-.708L7.5 9.293V2a2 2 0 0 1 2-2H14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V2a2 2 0 0 1 2-2h2.5a.5.5 0 0 1 0 1z"/></svg> Save Changes';
+            }
+        });
+    };
+
+    window.deleteCampaignFromEditor = function () {
+        if (!_peEditingCampaign) return;
+        if (!confirm("Xóa campaign '" + _peEditingCampaign.title + "'? Hành động này không thể hoàn tác.")) return;
+        var id = _peEditingCampaign.id;
+        fetch(apiBaseUrl() + "/api/Campaign/" + id, { method: "DELETE" })
+            .then(function (resp) {
+                if (resp.ok || resp.status === 204) {
+                    if (selectedCampaign && selectedCampaign.id === id) selectedCampaign = null;
+                    closePromptEditor();
+                    window.loadCampaigns();
+                }
+            })
+            .catch(function (err) { alert("Xóa thất bại: " + err.message); });
+    };
+
+    var _peSnippets = {
+        greeting: "\n\nMỞ ĐẦU CUỘC GỌI (luôn làm trước tiên):\n1) Chào hỏi tự nhiên: \"Xin chào! Em là [Tên] gọi từ [Công ty] ạ.\"\n2) Xác nhận đúng người nghe.\n3) Hỏi xem có tiện nói chuyện không.\n",
+        identity: "\n\nQUY TẮC NHẬN DẠNG:\n- Không được nói bạn là người thật.\n- Không bao giờ phá vỡ vai trò trừ khi bị hỏi trực tiếp và liên tục.\n- Nói chuyện tự nhiên như một nhân viên thật.\n",
+        tone: "\n\nPHONG CÁCH TRÒ CHUYỆN:\n- Thân thiện, chuyên nghiệp — dùng từ ngữ tự nhiên, lịch sự (\"dạ\", \"ạ\").\n- Câu nói ngắn gọn, dễ hiểu. Tránh đọc kịch bản.\n- Hỏi từng câu một và lắng nghe câu trả lời trước khi tiếp tục.\n",
+        scope: "\n\nGIỚI HẠN CHỦ ĐỀ:\n- Chỉ thảo luận về chủ đề liên quan trực tiếp đến chiến dịch.\n- Nếu hỏi lạc đề: \"Dạ câu hỏi hay, nhưng em chỉ hỗ trợ về [chủ đề] thôi ạ.\"\n",
+        closing: "\n\nKẾT THÚC CHUYÊN NGHIỆP:\n- Tóm tắt những gì đã thảo luận và bước tiếp theo đã thống nhất.\n- Cảm ơn và kết thúc lịch sự.\n",
+        rejection: "\n\nXỬ LÝ TỪ CHỐI:\n- Nếu khách từ chối: \"Dạ không sao ạ! Em cảm ơn anh/chị đã nghe máy.\"\n- Không ép buộc sau khi bị từ chối rõ ràng.\n",
+        escalate: "\n\nLEO THANG / CHUYỂN MÁY:\n- Nếu vấn đề vượt khả năng: hỏi khách có muốn được gặp nhân viên chuyên môn không.\n- Xác nhận số điện thoại/email trước khi kết thúc.\n"
+    };
+
+    window.insertPeSnippet = function (type) {
+        if (!_peSnippets[type]) return;
+        insertAtPeCursor(_peSnippets[type]);
+    };
+
+    window.insertAtPeCursor = function (text) {
+        var ta = document.getElementById("peInstructions");
+        if (!ta) return;
+        var start = ta.selectionStart;
+        var end = ta.selectionEnd;
+        ta.value = ta.value.substring(0, start) + text + ta.value.substring(end);
+        ta.selectionStart = ta.selectionEnd = start + text.length;
+        ta.focus();
+        updatePeCounter();
+    };
+
+    window.updatePeCounter = function () {
+        var ta = document.getElementById("peInstructions");
+        var el = document.getElementById("peCounter");
+        if (!ta || !el) return;
+        var len = ta.value.length;
+        var tokens = Math.round(len / 4);
+        el.textContent = len.toLocaleString() + " chars · ~" + tokens.toLocaleString() + " tokens";
+    };
+
+    window.updatePromptCounter = function () {
+        var ta = document.getElementById("prompt");
+        var el = document.getElementById("promptCharCounter");
+        if (!ta || !el) return;
+        var len = ta.value.length;
+        el.textContent = len > 0 ? len.toLocaleString() + " chars" : "";
+    };
+
+    // Close prompt editor on Escape key
+    document.addEventListener("keydown", function (e) {
+        if (e.key === "Escape") {
+            var overlay = document.getElementById("promptEditorOverlay");
+            if (overlay && !overlay.classList.contains("d-none")) {
+                closePromptEditor();
+            }
+        }
+    });
+
 })();

@@ -179,6 +179,41 @@ namespace ContactCenterPOC.Services
             return campaign;
         }
 
+        public async Task<Campaign?> UpdateAsync(string id, UpdateCampaignRequest request)
+        {
+            await EnsureInitializedAsync();
+
+            var campaign = _campaigns.FirstOrDefault(c => c.Id == id);
+            if (campaign == null) return null;
+
+            // Validate title uniqueness (exclude self)
+            if (_campaigns.Any(c => c.Id != id && c.Title.Equals(request.Title, StringComparison.OrdinalIgnoreCase)))
+            {
+                throw new InvalidOperationException($"A campaign with title '{request.Title}' already exists.");
+            }
+
+            campaign.Title = request.Title;
+            campaign.Description = request.Description;
+            campaign.AiBehaviorInstructions = request.AiBehaviorInstructions;
+
+            await SaveCampaignsAsync();
+            _logger.LogInformation("Updated campaign '{Title}' (ID={Id})", campaign.Title, campaign.Id);
+            return campaign;
+        }
+
+        public async Task<bool> DeleteAsync(string id)
+        {
+            await EnsureInitializedAsync();
+
+            var campaign = _campaigns.FirstOrDefault(c => c.Id == id);
+            if (campaign == null) return false;
+
+            _campaigns.Remove(campaign);
+            await SaveCampaignsAsync();
+            _logger.LogInformation("Deleted campaign '{Title}' (ID={Id})", campaign.Title, id);
+            return true;
+        }
+
         private static List<Campaign> GetDefaultCampaigns()
         {
             static string BuildDefaultPrompt(string agentName, string campaignSpecificInstructions)

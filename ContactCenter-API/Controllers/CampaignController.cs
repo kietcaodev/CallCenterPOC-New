@@ -63,6 +63,50 @@ namespace ContactCenterPOC.Controllers
                 });
             }
         }
+        [HttpPut("{id}")]
+        public async Task<IActionResult> UpdateCampaign(string id, [FromBody] UpdateCampaignRequest request)
+        {
+            if (!ModelState.IsValid)
+            {
+                var errors = ModelState.Values.SelectMany(v => v.Errors).Select(e => e.ErrorMessage).ToList();
+                return BadRequest(new { error = "Validation failed", message = string.Join("; ", errors) });
+            }
+
+            try
+            {
+                var campaign = await _campaignService.UpdateAsync(id, request);
+                if (campaign == null)
+                    return NotFound(new { error = "Campaign not found", message = $"No campaign with ID '{id}'" });
+                return Ok(campaign);
+            }
+            catch (InvalidOperationException ex)
+            {
+                return BadRequest(new { error = "Update failed", message = ex.Message });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error updating campaign {Id}", id);
+                return StatusCode(500, new { error = "Internal error", message = "Failed to update campaign" });
+            }
+        }
+
+        [HttpDelete("{id}")]
+        public async Task<IActionResult> DeleteCampaign(string id)
+        {
+            try
+            {
+                var deleted = await _campaignService.DeleteAsync(id);
+                if (!deleted)
+                    return NotFound(new { error = "Campaign not found", message = $"No campaign with ID '{id}'" });
+                return NoContent();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error deleting campaign {Id}", id);
+                return StatusCode(500, new { error = "Internal error", message = "Failed to delete campaign" });
+            }
+        }
+
         [HttpPost("reset")]
         public async Task<IActionResult> ResetCampaigns()
         {

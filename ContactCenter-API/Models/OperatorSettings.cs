@@ -4,7 +4,7 @@ namespace ContactCenterPOC.Models
     {
         public double MaxCallTimeMinutes { get; set; } = 2.0;
         public string VoiceApiMode { get; set; } = "ChatGPT";  // "ChatGPT", "VoiceLive", or "GeminiLive"
-        public string SelectedVoice { get; set; } = "alloy";   // alloy, echo, fable, onyx, nova, shimmer
+        public string SelectedVoice { get; set; } = "alloy";   // alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar
 
         // VoiceLive-specific fields
         public string TranscriptionMode { get; set; } = "BuiltIn";  // "BuiltIn" or "SeparateSTT"
@@ -21,7 +21,7 @@ namespace ContactCenterPOC.Models
 
         public static readonly HashSet<string> ValidVoices = new(StringComparer.OrdinalIgnoreCase)
         {
-            "alloy", "echo", "fable", "onyx", "nova", "shimmer"
+            "alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "marin", "cedar"
         };
 
         public static readonly HashSet<string> ValidVoiceLiveModels = new(StringComparer.OrdinalIgnoreCase)
